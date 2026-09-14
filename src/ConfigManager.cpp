@@ -388,7 +388,6 @@ StreamConfig StreamConfig::fromJson(const Json::Value& root) {
     // The two manual HLS timing modes are mutually exclusive. Pre-buffered PCR
     // interval pacing wins if an old API client accidentally submits both flags.
     if (config.hlsPcrPhasePacing) config.hlsSlowPcrAssist = false;
-    config.audioDelayMs = std::clamp(root.get("audio_delay_ms", 0).asUInt(), 0u, 5000u);
     config.testPattern = root.get("test_pattern", false).asBool();
     config.autoStart = root.get("auto_start", false).asBool();
     config.remapEnabled = root.get("remap_enabled", false).asBool();
@@ -469,7 +468,6 @@ Json::Value StreamConfig::toJson() const {
     root["hls_user_agent"] = hlsUserAgent;
     root["hls_slow_pcr_assist"] = hlsSlowPcrAssist;
     root["hls_pcr_phase_pacing"] = hlsPcrPhasePacing;
-    root["audio_delay_ms"] = audioDelayMs;
     root["test_pattern"] = testPattern;
     root["auto_start"] = autoStart;
     root["remap_enabled"] = remapEnabled;

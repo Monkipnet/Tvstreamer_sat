@@ -70,10 +70,6 @@ struct StreamConfig {
     // JSON key is retained for compatibility, but the mode is now feed-forward:
     // adjacent PCR anchors are known before packets enter the token sender. Off by default.
     bool hlsPcrPhasePacing = false;
-    // 203.58: optional passthrough audio timestamp correction. Positive values
-    // delay audio playback by shifting audio PES PTS/DTS forward. This does not
-    // buffer packets and does not alter PCR, CBR pacing or transcoded streams.
-    uint32_t audioDelayMs = 0;
     bool testPattern = false;
     bool autoStart = false;
     bool remapEnabled = false;
