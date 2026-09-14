@@ -10943,24 +10943,19 @@ void StreamManager::monitorBus(const std::string& id) {
             constexpr uint64_t kMinimumOutputBytesPerWindow = 7 * 188;
             constexpr uint64_t kCcDamageThreshold = 25;
             constexpr uint64_t kCcSevereThreshold = 250;
-            // 203.60: NETUP 203.53 intentionally withholds output while its
-            // 1500 ms reservoir fills.  The overload watchdog samples once per
-            // second, so the first two post-start samples can legitimately see
-            // active UDP input with zero output and falsely arm a rebuild loop.
-            // Suppress only the output-stall predicate for four seconds after
-            // start/rebuild.  CC damage remains active immediately, and a real
-            // output stall is still detected once the short startup grace ends.
-            constexpr auto kOutputStartupGrace = std::chrono::seconds(4);
             const bool mediaActive = inputDelta >= kActiveInputBytesPerWindow;
+            // 203.61: NETUP 203.53 intentionally buffers its startup reservoir
+            // before releasing the first 1316-byte TS block. During that
+            // normal startup interval input is already active while outputDelta
+            // is still zero. Treat output stall as recoverable damage only
+            // after this pipeline has actually emitted at least one TS block.
+            const bool outputStarted = outputNow >= kMinimumOutputBytesPerWindow;
             const bool continuityDamage =
                 inputCcDelta >= kCcDamageThreshold || outputCcDelta >= kCcDamageThreshold;
             const bool severeDamage =
                 inputCcDelta >= kCcSevereThreshold || outputCcDelta >= kCcSevereThreshold;
-            const bool outputStartupGrace =
-                state->lastOverloadRecovery != std::chrono::steady_clock::time_point::min() &&
-                now - state->lastOverloadRecovery < kOutputStartupGrace;
             const bool outputStalled =
-                !outputStartupGrace && mediaActive && outputDelta < kMinimumOutputBytesPerWindow;
+                outputStarted && mediaActive && outputDelta < kMinimumOutputBytesPerWindow;
             const bool damaged = continuityDamage || outputStalled;
 
             if (damaged) {
@@ -10974,6 +10969,7 @@ void StreamManager::monitorBus(const std::string& id) {
                               << " output_cc_delta=" << outputCcDelta
                               << " input_bytes=" << inputDelta
                               << " output_bytes=" << outputDelta
+                              << " output_started=" << (outputStarted ? "yes" : "no")
                               << " action=wait-for-clean-live-ts" << std::endl;
                 }
             } else {
