@@ -69,6 +69,8 @@ constexpr uint64_t kLateResetIntervals = 4ULL;
 constexpr uint64_t kPcrClockHz = 27000000ULL;
 constexpr uint64_t kPcrBaseModulus = (1ULL << 33);
 constexpr uint64_t kPcrTicksModulus = kPcrBaseModulus * 300ULL;
+constexpr uint64_t kPesTimestampClockHz = 90000ULL;
+constexpr uint64_t kPesTimestampModulus = (1ULL << 33);
 constexpr uint64_t kPeriodicPcrIntervalNanoseconds = 20ULL * 1000ULL * 1000ULL;
 // 203.07: HLS uses the 202.74 zero-phase startup path. No pre-send
 // packet consumption or PTS/PCR phase calibration is performed.
@@ -431,6 +433,83 @@ bool packetHasPayload(const std::array<guint8, kTsPacketSize>& packet) {
     const guint8 adaptationFieldControl =
         static_cast<guint8>((packet[3] >> 4) & 0x03);
     return adaptationFieldControl == 1 || adaptationFieldControl == 3;
+}
+
+std::size_t packetPayloadOffset(const std::array<guint8, kTsPacketSize>& packet) {
+    if (packet[0] != 0x47) return kTsPacketSize;
+    const guint8 adaptationFieldControl =
+        static_cast<guint8>((packet[3] >> 4) & 0x03);
+    if (adaptationFieldControl == 1) return 4;
+    if (adaptationFieldControl != 3) return kTsPacketSize;
+    const std::size_t adaptationLength = packet[4];
+    const std::size_t payloadOffset = 5 + adaptationLength;
+    return payloadOffset < kTsPacketSize ? payloadOffset : kTsPacketSize;
+}
+
+uint64_t readPesTimestamp90k(const guint8* timestamp) {
+    return ((static_cast<uint64_t>((timestamp[0] >> 1) & 0x07U) << 30) |
+            (static_cast<uint64_t>(timestamp[1]) << 22) |
+            (static_cast<uint64_t>((timestamp[2] >> 1) & 0x7FU) << 15) |
+            (static_cast<uint64_t>(timestamp[3]) << 7) |
+            static_cast<uint64_t>((timestamp[4] >> 1) & 0x7FU)) %
+        kPesTimestampModulus;
+}
+
+void writePesTimestamp90k(guint8* timestamp, uint64_t value) {
+    value %= kPesTimestampModulus;
+    // Keep the four-bit PTS/DTS prefix (0010/0011/0001) exactly as provided by
+    // the PES header and rewrite only the 33-bit timestamp payload + marker bits.
+    timestamp[0] = static_cast<guint8>(
+        (timestamp[0] & 0xF0U) | (((value >> 30) & 0x07U) << 1) | 0x01U);
+    timestamp[1] = static_cast<guint8>((value >> 22) & 0xFFU);
+    timestamp[2] = static_cast<guint8>(((value >> 15) & 0x7FU) << 1 | 0x01U);
+    timestamp[3] = static_cast<guint8>((value >> 7) & 0xFFU);
+    timestamp[4] = static_cast<guint8>((value & 0x7FU) << 1 | 0x01U);
+}
+
+bool shiftPesPtsDts(
+    std::array<guint8, kTsPacketSize>& packet,
+    uint16_t expectedPid,
+    uint64_t delayTicks90k,
+    bool& ptsShifted,
+    bool& dtsShifted) {
+    ptsShifted = false;
+    dtsShifted = false;
+    if (delayTicks90k == 0 || expectedPid >= 0x1FFF || packet[0] != 0x47) return false;
+    const uint16_t pid = packetPid(packet);
+    if (pid != expectedPid || (packet[1] & 0x40U) == 0) return false; // PES start only.
+
+    const std::size_t payloadOffset = packetPayloadOffset(packet);
+    if (payloadOffset + 14 > kTsPacketSize) return false;
+    guint8* const pes = packet.data() + payloadOffset;
+    if (pes[0] != 0x00 || pes[1] != 0x00 || pes[2] != 0x01) return false;
+    // MPEG-2 PES optional header: '10' marker in bits 7..6 of byte 6.
+    if ((pes[6] & 0xC0U) != 0x80U) return false;
+
+    const guint8 ptsDtsFlags = static_cast<guint8>((pes[7] >> 6) & 0x03U);
+    const std::size_t headerDataLength = pes[8];
+    if (9 + headerDataLength > kTsPacketSize - payloadOffset) return false;
+    if (ptsDtsFlags == 0x02U && headerDataLength < 5) return false;
+    if (ptsDtsFlags == 0x03U &&
+        (headerDataLength < 10 || payloadOffset + 19 > kTsPacketSize)) {
+        return false;
+    }
+
+    if (ptsDtsFlags == 0x02U || ptsDtsFlags == 0x03U) {
+        guint8* const pts = pes + 9;
+        const uint64_t shifted =
+            (readPesTimestamp90k(pts) + delayTicks90k) % kPesTimestampModulus;
+        writePesTimestamp90k(pts, shifted);
+        ptsShifted = true;
+    }
+    if (ptsDtsFlags == 0x03U) {
+        guint8* const dts = pes + 14;
+        const uint64_t shifted =
+            (readPesTimestamp90k(dts) + delayTicks90k) % kPesTimestampModulus;
+        writePesTimestamp90k(dts, shifted);
+        dtsShifted = true;
+    }
+    return ptsShifted || dtsShifted;
 }
 
 void clearPcrFlag(std::array<guint8, kTsPacketSize>& packet) {
@@ -848,6 +927,42 @@ public:
         if (mode == UdpShapingMode::Cbr && currentTargetBitrate() == 0) {
             error = "UDP CBR target_bitrate must be greater than zero";
             return;
+        }
+
+        // 203.58: TV3Bel arrives with a stable ~1.03-1.10 s audio lead while
+        // A/V rate drift is essentially zero. Correct only the presentation
+        // timestamps of configured audio PES packets. This deliberately does
+        // not buffer/reorder TS packets and cannot perturb provider-PCR rate
+        // locking, the synthetic transport PCR clock, CBR pacing or 203.57
+        // transcoder cadence.
+        if (cfg.audioDelayMs > 0) {
+            if (segmentedHlsInput && !cfg.transcodeEnabled &&
+                cfg.audioPid > 0 && cfg.audioPid < 0x1FFF) {
+                audioDelayMilliseconds = cfg.audioDelayMs;
+                audioDelayPid = static_cast<uint16_t>(cfg.audioPid);
+                audioDelayTicks90k = multiplyDivide(
+                    static_cast<uint64_t>(audioDelayMilliseconds),
+                    kPesTimestampClockHz,
+                    1000ULL);
+                std::cerr << "HLS A/V sync 203.58: stream=" << streamId
+                          << " audio_pid=" << audioDelayPid
+                          << " audio_delay_ms=" << audioDelayMilliseconds
+                          << " mode=audio-pes-pts-dts-forward"
+                          << " packet_buffering=off"
+                          << " pcr=unchanged cbr_pacing=unchanged transcoder=unchanged"
+                          << std::endl;
+            } else {
+                std::cerr << "HLS A/V sync 203.58: stream=" << streamId
+                          << " configured_audio_delay_ms=" << cfg.audioDelayMs
+                          << " action=disabled"
+                          << " reason="
+                          << (cfg.transcodeEnabled
+                                ? "transcoder-active"
+                                : (!segmentedHlsInput
+                                      ? "not-segmented-hls"
+                                      : "invalid-audio-pid"))
+                          << std::endl;
+            }
         }
 
         const uint64_t initialTransportBitrate = mode == UdpShapingMode::Cbr
@@ -2054,6 +2169,19 @@ private:
             observeDeclaredPcrFromPmt(packet.bytes);
             cachePeriodicRemappedPsi(packet.bytes);
             packet.pid = packetPid(packet.bytes);
+            if (audioDelayTicks90k > 0 && packet.pid == audioDelayPid) {
+                bool ptsShifted = false;
+                bool dtsShifted = false;
+                if (shiftPesPtsDts(
+                        packet.bytes,
+                        audioDelayPid,
+                        audioDelayTicks90k,
+                        ptsShifted,
+                        dtsShifted)) {
+                    if (ptsShifted) ++audioPtsShifted;
+                    if (dtsShifted) ++audioDtsShifted;
+                }
+            }
             packet.hasPcr = parsePcr(packet.bytes, packet.sourcePcrTicks, packet.discontinuity);
             if (segmentedHlsInput || continuousNetworkMpegTsInput) {
                 observePcrRate(packet);
@@ -3471,6 +3599,9 @@ private:
                   << " pcr_inserted=" << insertedPeriodicPcrPackets.load(std::memory_order_relaxed)
                   << " pcr_source_stripped=" << strippedSourcePcrPackets.load(std::memory_order_relaxed)
                   << " pcr_missed_intervals=" << missedPeriodicPcrIntervals.load(std::memory_order_relaxed)
+                  << " audio_delay_ms=" << audioDelayMilliseconds
+                  << " audio_pts_shifted=" << audioPtsShifted.load(std::memory_order_relaxed)
+                  << " audio_dts_shifted=" << audioDtsShifted.load(std::memory_order_relaxed)
                   << " pcr_pid=" << periodicPcrPid
                   << " pcr_declared=" << (declaredPcrPidValid ? declaredPcrPid : 0x1FFF)
                   << " pcr_program=" << declaredPcrProgram
@@ -3550,6 +3681,9 @@ private:
     const bool segmentedHlsInput = false;
     const bool hlsPcrDeadlineShaperEnabled = false;
     const bool hlsSlowPcrAssistEnabled = false;
+    uint32_t audioDelayMilliseconds = 0;
+    uint16_t audioDelayPid = 0x1FFF;
+    uint64_t audioDelayTicks90k = 0;
     const bool continuousNetworkMpegTsInput = false;
     const bool forceSyntheticPcr = false;
     const uint64_t startupReservoirDurationNanoseconds = 0;
@@ -3723,6 +3857,8 @@ private:
     std::atomic<uint64_t> insertedPeriodicPcrPackets{0};
     std::atomic<uint64_t> strippedSourcePcrPackets{0};
     std::atomic<uint64_t> missedPeriodicPcrIntervals{0};
+    std::atomic<uint64_t> audioPtsShifted{0};
+    std::atomic<uint64_t> audioDtsShifted{0};
     std::atomic<uint64_t> validTimestampChunks{0};
     std::atomic<uint64_t> missingTimestampChunks{0};
     std::atomic<uint64_t> startupReservoirBytes{0};
