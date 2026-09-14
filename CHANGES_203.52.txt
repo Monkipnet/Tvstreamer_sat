@@ -1,0 +1,83 @@
+TVStreammerSAT5 203.52
+======================
+
+Название изменения
+------------------
+NETUP remux 1316-byte packetizer перед byte-rate pacer.
+
+Причина
+-------
+203.51 заменил PCR-derived tsparse/clocksync на identity/datarate и сохранил
+правильную AAC PTS-сетку 203.50, но production HTTP и SRT выдавали MPEG-TS
+крупными порциями примерно раз в две секунды. Средний bitrate оставался
+правильным, однако low-latency SRT показывал одновременные затыки видео/аудио.
+
+Измерения 203.51:
+
+    HTTP, 60 s: gaps >250 ms=29, gaps >1 s=28, max=2668 ms
+    SRT, 120 s: gaps >250 ms=58, gaps >1 s=58, max=2420 ms
+
+Production-equivalent A/B с неперетаймливающим packetizer:
+
+    PACKETIZED_IDENTITY, 120 s:
+      gaps >250 ms=2
+      gaps >1 s=1 (startup 1501 ms)
+      единственный steady-state >250 ms=250.870 ms
+
+Изменения 203.52
+----------------
+Только для strict NETUP HTTP/SRT CBR remux новая цепь:
+
+    mpegtsmux
+      -> tsparse set-timestamps=false alignment=7
+      -> identity sync=true single-segment=true
+                  datarate=target_bitrate/8
+      -> output queue
+      -> sink
+
+Packetizer делит грубые GOP/segment-sized выходные единицы на TS-буферы:
+
+    7 * 188 = 1316 bytes
+
+Так как set-timestamps=false, packetizer не выполняет PCR-derived timing
+correction и не меняет внутренние MPEG-TS PCR/PES PTS/DTS.
+
+Сохранено без изменений
+-----------------------
+- 203.50: tsdemux ignore-pcr=true для NETUP HTTP/SRT remux.
+- 203.51: identity/datarate byte-rate pacing, clocksync=off, reservoir=off.
+- mpegtsmux bitrate/NULL stuffing/PAT/PMT/PCR и alignment=7.
+- Входной srtclientsrc do-timestamp=true.
+- GstHttpOutputProtocol/GstSrtOutputProtocol транскодера.
+- HLS, UDP, RTP, RTSP, RTMP и StableUdpOutput.
+- SRT clean-start/recovery 203.49.
+
+Диагностические маркеры
+-----------------------
+Сохраняются:
+
+    NETUP remux audio timing 203.50: ... tsdemux_ignore_pcr=true
+    NETUP remux pacing 203.51: ... pacer=identity-datarate
+
+Новый marker:
+
+    NETUP remux packet pacing 203.52: ... packetizer=tsparse
+      alignment=7 set_timestamps=false buffer_bytes=1316
+      pacer=identity-datarate
+
+Проверки
+--------
+- git diff --check: PASS.
+- Incremental patch проверяется поверх чистого полного исходника 203.51.
+- ZIP проверяется через unzip -t и SHA256.
+- Clean Release build: PASS (CMake 3.28.3, GCC 13.3.0,
+  GStreamer development packages 1.24.2).
+- Готовый ELF содержит версию 203.52 и маркеры 203.50/203.51/203.52.
+
+Production acceptance
+---------------------
+1. Проверить все маркеры 203.50, 203.51 и 203.52 для HTTP и SRT.
+2. Повторить 120-секундный raw HTTP/SRT wall-gap monitor.
+3. Ожидание: нет двухсекундных циклов; gaps >250 ms ноль или единичные.
+4. Проверить визуально SRT без дополнительной многосекундной подкачки.
+5. Повторить AAC PTS анализ: 21.333/21.334 ms, отклонения >0.5 ms отсутствуют.

@@ -1,0 +1,55 @@
+TVStreammerSAT5 203.57
+======================
+
+Purpose
+-------
+A/B test the measured shared-transcoder realtime deficit by reducing the
+transcoded video cadence from 50p to 25p while preserving the 203.56 output
+pacing and all other protected paths.
+
+Measured evidence before this change
+------------------------------------
+On 203.56, over 90 s of wall time the transcoder produced approximately:
+  video 86.160 s
+  audio 86.165 s
+  PCR   86.092 s
+This is about 95.7% realtime (~4.3% slow), matching the periodic client stalls.
+Video/audio TS continuity counters were clean, and PTS/PCR had no discontinuities.
+
+Changes
+-------
+1. Shared non-test video preprocessing now uses:
+     deinterlace method=yadif mode=auto-strict fields=top locking=passive
+   instead of fields=all.
+   GStreamer documents that fields=all doubles the output framerate; fields=top
+   emits only top fields and avoids the doubled cadence.
+
+2. Added an explicit cadence limiter immediately after deinterlace:
+     videorate ! video/x-raw,framerate=25/1
+   so progressive or unusual inputs also feed the expensive scale/convert/encode
+   portion at 25 fps.
+
+3. Encoder GOP key-int is changed from 50 frames to 25 frames so the target GOP
+   duration remains approximately one second at 25 fps.
+
+4. Added runtime marker:
+     GStreamer transcoder 203.57 ... deinterlace=yadif-top-fields cadence=fixed-25p
+
+Unchanged / protected
+---------------------
+- 203.56 SRT/HTTP byte-rate CBR pacing.
+- HLS output path and scheduler/provider timing.
+- NETUP 203.53 output reservoir pacer.
+- Ivy Bridge software H.264 decoder policy (avdec_h264).
+- Intel VAAPI / x264 encoder selection and bitrates.
+- Audio chain and AAC bitrate.
+- Shared one-decode/one-encode architecture.
+- Watchdog and restart policy.
+- PID/service remapping.
+- No QSV changes are introduced.
+
+Expected validation
+-------------------
+The 90 s TS clock test should improve from ~86.16 s media / 90 s wall toward
+~89.9-90.0 s media / 90 s wall. Visual stalls should disappear or become
+substantially less frequent if the 50p processing load was the bottleneck.

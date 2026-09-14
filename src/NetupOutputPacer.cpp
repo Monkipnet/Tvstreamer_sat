@@ -206,41 +206,8 @@ private:
         return written == kChunkBytes;
     }
 
-    bool waitForStartup(bool& srtDeadlineFallback) {
-        srtDeadlineFallback = false;
+    bool waitForStartup() {
         std::unique_lock<std::mutex> lock(mutex);
-
-        if (outputType == "srt") {
-            // 203.59: An SRT listener can accept callers before the upstream TS
-            // path produces its first packet.  In 203.53-203.58 the sender
-            // waited forever for a full startup reservoir.  If the upstream
-            // UDP/remux branch stalled in that state, srtsink stayed alive but
-            // never received buffers, so broken callers were not reaped by
-            // gst_srt_object_write_to_callers() and their libsrt epolls could
-            // accumulate until the process hit RLIMIT_NOFILE.  Keep the proven
-            // 1.5 s reservoir start when data arrives normally, but make 1.5 s
-            // a hard maximum wait for SRT.  After the deadline the existing
-            // monotonic CBR loop runs with PID 0x1FFF NULL packets until real
-            // 1316-byte TS chunks become available.
-            const auto deadline = std::chrono::steady_clock::now() +
-                std::chrono::milliseconds(kStartupReservoirMilliseconds);
-            condition.wait_until(lock, deadline, [this] {
-                return stopping || upstreamEnded || queuedBytes >= startupBytes;
-            });
-
-            if (stopping) {
-                return false;
-            }
-            if (upstreamEnded && queuedBytes < kChunkBytes) {
-                return false;
-            }
-
-            srtDeadlineFallback = queuedBytes < startupBytes;
-            return true;
-        }
-
-        // HTTP keeps the exact 203.53 startup semantics: do not start until a
-        // full 1.5 s byte reservoir is available (or EOS leaves a final chunk).
         condition.wait(lock, [this] {
             return stopping || queuedBytes >= startupBytes ||
                    (upstreamEnded && queuedBytes >= kChunkBytes);
@@ -254,8 +221,7 @@ private:
     }
 
     void sendLoop() {
-        bool srtDeadlineFallback = false;
-        if (!waitForStartup(srtDeadlineFallback)) {
+        if (!waitForStartup()) {
             return;
         }
 
@@ -273,34 +239,11 @@ private:
                   << " chunk_bytes=" << kChunkBytes
                   << " chunk_interval_us=" << (chunkIntervalNanoseconds / 1000ULL)
                   << " clock=monotonic-absolute"
-                  << " startup_mode=" << (srtDeadlineFallback ? "srt-deadline-fallback" : "real-reservoir")
                   << std::endl;
-
-        const bool startsWithNull = startQueued < kChunkBytes;
-        if (srtDeadlineFallback) {
-            std::cerr << "NETUP SRT liveness 203.59: stream=" << streamId
-                      << " type=" << outputType
-                      << " event=deadline-start"
-                      << " reason=startup-reservoir-not-full"
-                      << " startup_deadline_ms=" << kStartupReservoirMilliseconds
-                      << " queued_bytes=" << startQueued
-                      << " initial_output=" << (startsWithNull ? "null-pid-0x1fff" : "real-ts")
-                      << " cbr_clock=unchanged"
-                      << std::endl;
-            if (startsWithNull) {
-                std::cerr << "NETUP SRT liveness 203.59: stream=" << streamId
-                          << " type=" << outputType
-                          << " event=null-start"
-                          << " reason=no-full-ts-chunk-before-startup-deadline"
-                          << " fallback=null-pid-0x1fff"
-                          << std::endl;
-            }
-        }
 
         uint64_t nextDeadline = monotonicNanoseconds();
         uint64_t emittedChunks = 0;
         guint8 nullContinuity = 0;
-        bool realDataAnnounced = !startsWithNull;
 
         while (true) {
             {
@@ -327,15 +270,6 @@ private:
                 }
                 fillNullChunk(chunk, nullContinuity);
                 ++underflowChunks;
-            } else if (!realDataAnnounced) {
-                realDataAnnounced = true;
-                std::cerr << "NETUP SRT liveness 203.59: stream=" << streamId
-                          << " type=" << outputType
-                          << " event=real-data-resumed"
-                          << " after_null_chunks=" << underflowChunks
-                          << " packetization=7x188"
-                          << " cbr_clock=unchanged"
-                          << std::endl;
             }
 
             GstBuffer* output = gst_buffer_new_allocate(nullptr, kChunkBytes, nullptr);
@@ -351,9 +285,6 @@ private:
                           << " type=" << outputType
                           << " event=downstream-stop"
                           << " flow=" << static_cast<int>(flow)
-                          << " reason=" << (flow == GST_FLOW_FLUSHING
-                                ? "normal-flushing-teardown"
-                                : "downstream-flow-error")
                           << " emitted_chunks=" << emittedChunks
                           << " underflow_chunks=" << underflowChunks
                           << std::endl;

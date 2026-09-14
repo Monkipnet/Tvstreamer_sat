@@ -1,0 +1,71 @@
+TVStreammerSAT5 203.55
+=======================
+
+Goal
+----
+Remove the repeatable pause/burst cadence from transcoded SRT and HTTP MPEG-TS outputs.
+
+Evidence
+--------
+- Direct RAW TCP capture from the transcoder internal tcpserversink showed repeated
+  ~100-160 ms no-data gaps (peaks above 200 ms).
+- At every gap, consecutive video PTS still advanced by 20.0 ms and audio PTS by
+  21.3 ms. This proves encoded A/V timestamps are continuous and the defect is
+  wall-clock delivery pacing after mpegtsmux, not frame loss, encoder load, or
+  transcoder restart.
+- The old SRT/HTTP path used:
+    mpegtsmux
+    -> tsparse set-timestamps=true smoothing-latency=100000
+    -> clocksync sync-to-first=true
+    -> queue
+    -> clocksync ts-offset=250000000
+    -> queue
+    -> sink sync=false
+  GStreamer defines smoothing-latency in microseconds, so 100000 is 100 ms.
+
+203.55 change
+-------------
+For transcoded SRT and HTTP MPEG-TS outputs only:
+- Preserve MPEG-TS PCR/PTS with tsparse set-timestamps=false alignment=7.
+- Remove the PCR-derived tsparse timestamp rewrite.
+- Remove both network clocksync gates and the 250 ms post-mux reservoir clock gate.
+- Use the existing identity byte-rate CBR pacer:
+    identity single-segment=true sync=true datarate=muxBitrate/8
+  This creates one monotonic transport-byte clock independent of PCR jitter and
+  avoids periodic pause/burst release into sinks configured sync=false.
+- Keep the existing final output queues.
+
+Protected / unchanged
+---------------------
+- HLS output branch is unchanged.
+- HLS scheduler and provider timing are unchanged.
+- NETUP 203.53 reservoir pacer is unchanged.
+- Decoder selection / Intel Ivy Bridge avdec_h264 recovery policy unchanged.
+- Intel VAAPI / x264 encoder selection unchanged.
+- MPEG-TS bitrate, PID/service remap, PAT/PMT/PCR intervals unchanged.
+- SRT relay/caller configuration unchanged.
+- HTTP relay/listener behavior unchanged.
+- UDP/RTP transcoder branches unchanged.
+
+Expected gst-launch fragments
+-----------------------------
+SRT CBR:
+  mpegtsmux ... bitrate=<target>
+  ! tsparse name=transcode_srt_ts_align set-timestamps=false alignment=7
+  ! identity name=transcode_srt_byte_cbr_pacer silent=true signal-handoffs=false
+      single-segment=true sync=true datarate=<target_bytes_per_second>
+  ! queue name=transcode_srt_output_queue ...
+
+HTTP CBR:
+  mpegtsmux ... bitrate=<target>
+  ! tsparse name=transcode_http_ts_align set-timestamps=false alignment=7
+  ! identity name=transcode_http_byte_cbr_pacer silent=true signal-handoffs=false
+      single-segment=true sync=true datarate=<target_bytes_per_second>
+  ! queue name=transcode_http_output_queue ...
+
+A/B validation
+--------------
+Run the same /tmp/watch_raw_ts.py against tcp://127.0.0.1:<internal-port>.
+The old 203.53 path repeatedly showed 100-160 ms TCP_RECV_GAP. 203.55 should
+substantially reduce/eliminate those gaps while keeping video PTS step 20.0 ms and
+audio PTS step 21.3 ms for the tested 50 fps / 48 kHz AAC stream.

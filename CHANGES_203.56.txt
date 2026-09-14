@@ -1,0 +1,64 @@
+TVStreammerSAT5 203.56
+=======================
+
+Goal
+----
+Make the 203.55 SRT/HTTP byte-rate pacing test clean by removing the two
+pre-encode clocksync elements that were introduced experimentally in 203.54.
+
+Why 203.56 is required
+----------------------
+The deployed 203.55 gst-launch command proved that the new SRT/HTTP output path
+was active, but it also still contained:
+  clocksync name=transcode_video_frame_clock sync=true sync-to-first=false
+  clocksync name=transcode_audio_frame_clock sync=true sync-to-first=false
+Those elements belong to the rejected 203.54 experiment. Therefore 203.55 was
+not a clean A/B test of the post-mux byte-rate pacer and its remaining stalls
+cannot be attributed to the new output pacing alone.
+
+203.56 change
+-------------
+- Explicitly revert GstTranscoderProcess.cpp to the proven 203.53 transcoder
+  common A/V path.
+- Remove transcode_video_frame_clock.
+- Remove transcode_audio_frame_clock.
+- Remove the 203.54 shared transcoder cadence log marker and its extra
+  clocksync availability requirement.
+- Keep the 203.55 SRT/HTTP output change intact:
+    mpegtsmux
+    -> tsparse set-timestamps=false alignment=7
+    -> identity single-segment=true sync=true datarate=muxBitrate/8
+    -> output queue
+    -> sink sync=false
+
+Protected / unchanged
+---------------------
+- HLS output branch unchanged from 203.53.
+- HLS scheduler/provider timing unchanged.
+- NETUP 203.53 reservoir pacer unchanged.
+- Intel Ivy Bridge software H.264 decode policy unchanged.
+- Intel VAAPI/x264 encoder selection unchanged.
+- MPEG-TS bitrate, PID/service remap and PAT/PMT/PCR intervals unchanged.
+- SRT listener/caller relay behavior unchanged.
+- HTTP relay behavior unchanged.
+
+Validation
+----------
+The actual 203.56 gst-launch command MUST contain:
+  transcode_srt_ts_align ... set-timestamps=false
+  transcode_srt_byte_cbr_pacer ... datarate=<...>
+  transcode_http_ts_align ... set-timestamps=false
+  transcode_http_byte_cbr_pacer ... datarate=<...>
+
+It MUST NOT contain:
+  transcode_video_frame_clock
+  transcode_audio_frame_clock
+  transcode_srt_ts_smoother
+  transcode_srt_cbr_clock
+  transcode_srt_av_reservoir
+  transcode_http_ts_smoother
+  transcode_http_cbr_clock
+  transcode_http_av_reservoir
+
+Repeat /tmp/watch_raw_ts.py against tcp://127.0.0.1:<internal-port> and compare
+TCP_RECV_GAP with the old 203.53 baseline.

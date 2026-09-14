@@ -1,0 +1,55 @@
+TVStreammerSAT5 203.54 — shared transcoder pre-encode wall-clock cadence
+Date: 2026-09-12
+
+Problem reproduced on stream stream-1788080728047 / SvetloetTVHD_BY:
+- progressive A/V stutter appears only when transcoding is enabled;
+- changing input protocol does not remove it;
+- changing the number of outputs does not remove it;
+- without transcoding the same streams are stable;
+- x264 used about 230% CPU on the 2-core/4-thread Ivy Bridge host;
+- Intel VAAPI vah264enc reduced transcoder CPU to about 90%, but the same stutter was still observed;
+- output HLS video PTS was continuous: 5998 packets over 119.94 s, median/max positive PTS step 20 ms;
+- therefore the defect is treated as wall-clock delivery/cadence, not missing encoded timestamps or encoder throughput.
+
+203.54 change:
+1. Add a clocksync immediately before the shared H.264 encoder, after deinterlace/scale/final raw caps:
+   transcode_video_frame_clock sync=true sync-to-first=false
+2. Add a clocksync immediately before the shared audio encoder, after audioresample/audiorate/final raw audio caps:
+   transcode_audio_frame_clock sync=true sync-to-first=false
+3. Both clocksync elements use the common pipeline running-time derived from buffer timestamps + SEGMENT events.
+4. Add clocksync to the transcoder availability check because HLS-only transcoding now also needs it.
+5. Add runtime marker:
+   GStreamer shared transcoder cadence 203.54: video=decoded-running-time-clocksync audio=normalized-running-time-clocksync sync_to_first=false scope=pre-encode hls_postmux_timestamps=unchanged
+
+Intent:
+- throttle burst-fed decoded HLS/HTTP/file-like inputs to real time before encoding;
+- keep audio and video on the same pipeline clock;
+- prevent encode/mux from running ahead during a burst and starving later;
+- make the correction common to HLS/SRT/HTTP outputs, before their per-output mux branches.
+
+Protected behavior intentionally NOT changed:
+- HLS post-mux path remains tsparse set-timestamps=false (202.79 protection);
+- HLS scheduler constants and provider timing are unchanged;
+- SRT/HTTP post-mux tsparse/clocksync/reservoir chain is unchanged in this release;
+- 203.53 NETUP output reservoir pacer is unchanged;
+- decoder policy remains avdec_h264 recovery on Intel Ivy Bridge;
+- Intel/x264/NVENC encoder selection and bitrate/GOP settings are unchanged;
+- shared one-decode/one-encode architecture and per-output muxes are unchanged;
+- watchdog timeout/restart policy is unchanged.
+
+Expected gst-launch additions for a live transcoder:
+Video:
+  ... videoscale ... ! video/x-raw,... ! clocksync name=transcode_video_frame_clock sync=true sync-to-first=false ! <h264 encoder> ...
+Audio:
+  ... audiorate ... ! audio/x-raw,... ! clocksync name=transcode_audio_frame_clock sync=true sync-to-first=false ! <aac/mp3 encoder> ...
+
+Verification after deploy:
+  journalctl -u tvstreammersat5.service --since "2 minutes ago" --no-pager \
+  | grep -E '203\.54|transcode_video_frame_clock|transcode_audio_frame_clock|GStreamer transcoder command'
+
+Then test the same channel for at least several minutes on Intel VAAPI and check that the former 13-17 second pause/burst pattern does not recur.
+
+Build validation in the artifact-generation container:
+- source/patch structure checked;
+- full CMake build could not run because that container does not have GStreamer development pkg-config packages installed. The failure occurs at CMake dependency discovery, before C++ compilation.
+- production Ubuntu build commands are included with the release artifacts.

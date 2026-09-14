@@ -1,0 +1,88 @@
+TVStreammerSAT5 203.51
+======================
+
+Название изменения
+------------------
+NETUP remux byte-rate pacing без PCR-derived tsparse/clocksync.
+
+Причина
+-------
+Для NETUP compatibility remux связка
+
+    mpegtsmux -> tsparse set-timestamps=true -> clocksync
+
+создавала периодические паузы выдачи всего MPEG-TS (видео и звук вместе).
+Лабораторный FULL_PACER воспроизвёл группы пауз 250-313 ms, тогда как
+identity/datarate-pacer почти полностью устранил паузы >250 ms.
+
+Проверка исходного сервера транскодирования показала непрерывную временную
+сетку на исходном HLS, HLS после общего Intel-транскодера и SRT :5900:
+
+    video DTS step: 20.000 ms
+    audio DTS step: 21.333/21.334 ms
+    backwards: 0
+    DTS gaps >50 ms: 0
+
+Разница длительности SRT соответствовала только времени подключения/probe
+FFmpeg. Поэтому транскодерные HTTP/SRT-ветки не изменяются.
+
+Изменения 203.51
+----------------
+Только в StreamManager::buildRemapPipeline() для strict NETUP HTTP/SRT CBR:
+
+    ДО:
+      mpegtsmux
+        -> tsparse set-timestamps=true smoothing-latency=100000
+        -> clocksync sync=true sync-to-first=true
+        -> output queue
+        -> sink
+
+    ПОСЛЕ:
+      mpegtsmux
+        -> identity sync=true single-segment=true
+                    datarate=target_bitrate/8
+        -> output queue
+        -> sink
+
+Для target_bitrate=7000000 identity получает datarate=875000 bytes/s.
+
+Сохранено без изменений
+-----------------------
+- Исправление 203.50: tsdemux ignore-pcr=true для strict NETUP HTTP/SRT remux.
+- mpegtsmux bitrate, NULL stuffing, PAT/PMT/PCR intervals и alignment=7.
+- Входной srtclientsrc do-timestamp=true.
+- Транскодерные GstHttpOutputProtocol/GstSrtOutputProtocol ветки.
+- HLS, UDP, RTP, RTSP, RTMP и StableUdpOutput.
+- SRT clean-start/recovery 203.49.
+- Существующая output queue; дополнительный reservoir не добавляется.
+
+Диагностические маркеры
+-----------------------
+203.50 остаётся активным:
+
+    NETUP remux audio timing 203.50: ... tsdemux_ignore_pcr=true
+
+Новый маркер:
+
+    NETUP remux pacing 203.51: ... target_bitrate=7000000
+      bytes_per_second=875000 pacer=identity-datarate
+      tsparse_timestamps=off clocksync=off reservoir=off
+
+Проверки исходников
+-------------------
+- git diff --check: PASS.
+- Версия AppVersion.h: 203.51.
+- Область изменения: src/AppVersion.h и src/StreamManager.cpp.
+- Локальная компиляция в среде подготовки не выполнена: отсутствуют cmake,
+  pkg-config и development headers GStreamer. Требуется clean build на целевой
+  Ubuntu по командам из сопровождающего ответа.
+
+Production acceptance
+---------------------
+1. Убедиться по journalctl, что для SvetloetvHD HTTP и SRT присутствуют оба
+   маркера 203.50 и 203.51.
+2. Повторить 180-секундный HTTP wall-gap monitor.
+3. Ожидается отсутствие кластеров выдачи >250 ms и исчезновение одновременных
+   затыков видео/звука.
+4. Повторить AAC PTS анализ: шаг должен остаться 21.333/21.334 ms без
+   отклонений >0.5 ms.

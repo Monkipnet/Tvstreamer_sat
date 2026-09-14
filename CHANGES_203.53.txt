@@ -1,0 +1,134 @@
+TVStreammerSAT5 203.53
+======================
+
+Название изменения
+------------------
+NETUP output reservoir pacer: реальный wall-clock CBR smoothing для strict
+NETUP HTTP/SRT remux после burst-ориентированного HLS входа.
+
+Подтверждённая причина
+----------------------
+Production tcpdump на SvetloetvHD показал, что SRT :12000 выдаёт транспорт
+пачками с регулярными паузами порядка 1.86-2.14 s (максимум в измеренном
+фрагменте ~2.376 s). Журнал HLS scheduler показал точное совпадение этих
+возобновлений с приходом очередного 2 s HLS сегмента:
+
+  HLS segment 769: 19:46:57.804067
+  SRT resumes:     19:46:57.805932
+
+  HLS segment 770: 19:46:59.999888
+  SRT resumes:     19:47:00.000901
+
+  HLS segment 771: 19:47:02.191945
+  SRT resumes:     19:47:02.193913
+
+То есть burst HLS сегмента проходил через remux почти напрямую. 203.51
+identity/datarate и 203.52 tsparse alignment=7 не обеспечили физическое
+распределение байтов во времени.
+
+Изменения 203.53
+----------------
+1. Добавлен отдельный NetupOutputPacer только для strict NETUP HTTP/SRT CBR
+   remux в StreamManager::buildRemapPipeline().
+
+2. Новый путь:
+
+     mpegtsmux
+       -> tsparse alignment=7 set-timestamps=false
+       -> NetupOutputPacer
+            appsink
+              -> bounded byte reservoir
+              -> CLOCK_MONOTONIC absolute-deadline sender
+              -> appsrc
+       -> existing output queue
+       -> HTTP/SRT sink
+
+3. Размер выходного блока фиксирован:
+
+     7 * 188 = 1316 bytes
+
+   Для target_bitrate=7000000:
+
+     875000 bytes/s
+     1316-byte interval = 1.504 ms
+
+   Для target_bitrate=4000000:
+
+     500000 bytes/s
+     1316-byte interval = 2.632 ms
+
+4. Startup reservoir = 1500 ms. Это удерживает начало передачи до накопления
+   реального запаса и развязывает wall-clock выход от границ HLS сегментов.
+
+5. Reservoir bounded per output branch: 16 MiB. При достижении лимита upstream
+   получает backpressure вместо неограниченного роста памяти.
+
+6. Если после старта реальный TS временно закончился, pacer продолжает CBR
+   безопасными MPEG-TS NULL packet (PID 0x1FFF) блоками. Никакого catch-up burst
+   после задержки sender thread нет: при опоздании >4 packet intervals
+   wall-clock phase сбрасывается на текущий CLOCK_MONOTONIC.
+
+7. PTS/DTS не используются для выпуска из reservoir. appsrc получает пакеты
+   уже в wall-clock cadence; HTTP/SRT sinks остаются sync=false как раньше.
+
+Новые маркеры
+-------------
+Startup-конфигурация ветки:
+
+  NETUP output reservoir pacer 203.53: stream=... name="..." type=srt|http
+    target_bitrate=... bytes_per_second=...
+    packetizer=tsparse alignment=7 set_timestamps=false chunk_bytes=1316
+    startup_reservoir_ms=1500 max_reservoir_mb=16
+    pacer=monotonic-absolute underflow=null-ts identity=off clocksync=off
+
+После заполнения startup reservoir sender пишет один marker:
+
+  NETUP output reservoir 203.53: stream=... type=... event=start
+    target_bitrate=... startup_ms=1500 startup_bytes=...
+    queued_bytes=... chunk_bytes=1316 chunk_interval_us=...
+    clock=monotonic-absolute
+
+Сохранено без изменений
+-----------------------
+- 203.50 tsdemux ignore-pcr=true для strict NETUP HTTP/SRT remux.
+- mpegtsmux target bitrate / NULL stuffing / PAT / PMT / PCR settings.
+- HLS scheduler 203.42, LOW6/TARGET8/HIGH12, fetch/retry/defer logic.
+- HLS provider timestamp handling and consumption ledger.
+- Transcoder architecture and SRT clean-start/recovery 203.49.
+- UDP / RTP / RTSP / RTMP output paths.
+- StableUdpOutput and its existing UDP reservoirs/shapers.
+- HLS output branch.
+- HTTP relay architecture and SRT listener behaviour.
+
+Файлы исходников
+----------------
+- CMakeLists.txt
+- src/AppVersion.h
+- src/StreamManager.cpp
+- src/NetupOutputPacer.h (new)
+- src/NetupOutputPacer.cpp (new)
+- CHANGES_203.53.txt
+
+Проверки подготовки
+-------------------
+- Version: 203.53.
+- New NetupOutputPacer.cpp C++ syntax-check: PASS using GStreamer API stubs.
+- GStreamer API usage cross-checked against appsrc/appsink documentation.
+- Whitespace diff check: no whitespace errors.
+- FULL_SOURCE archive integrity must be checked with unzip -t after packaging.
+- Full target build is still required on Ubuntu because the artifact container
+  does not have the project GStreamer development packages installed.
+
+Production acceptance
+---------------------
+1. После запуска убедиться, что для SvetloetvHD присутствует 203.50 marker и
+   два 203.53 markers для type=srt и type=http.
+2. tcpdump на исходящем SRT :12000 в течение 180 s: регулярных 1.8-2.4 s gaps
+   быть не должно. Нормальный 1316-byte cadence для 7 Mbit/s ~1.504 ms.
+3. Повторить HTTP wall-gap monitor: исчезновение тех же сегментных пауз.
+4. Проверить видео+аудио минимум 10 минут, включая steady state после первых
+   нескольких минут.
+5. Повторить AAC PTS анализ: 48 kHz AAC должен сохранить шаг 21.333/21.334 ms.
+6. Если появятся длительные upstream HLS потери, сеть должна продолжать CBR
+   NULL TS вместо полного прекращения передачи; media freeze при реальной потере
+   источника остаётся ожидаемым, но сетевого 2 s burst/gap цикла быть не должно.
