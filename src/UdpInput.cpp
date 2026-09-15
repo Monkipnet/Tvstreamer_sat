@@ -30,7 +30,7 @@ void logUdpReceiveBuffer20363(GSocket* socket, const char* scope) {
     int kernelReported = 0;
     socklen_t length = sizeof(kernelReported);
     if (::getsockopt(fd, SOL_SOCKET, SO_RCVBUF, &kernelReported, &length) != 0) {
-        std::cerr << "UDP INPUT BUFFER 203.63: scope=" << (scope ? scope : "unknown")
+        std::cerr << "UDP INPUT BUFFER 203.64: scope=" << (scope ? scope : "unknown")
                   << " requested_bytes=" << kSocketBufferSize
                   << " actual=unknown errno=" << errno
                   << " error=\"" << std::strerror(errno) << "\"" << std::endl;
@@ -40,14 +40,14 @@ void logUdpReceiveBuffer20363(GSocket* socket, const char* scope) {
     // accounts bookkeeping overhead internally. Divide by two for a practical
     // comparison with the requested buffer and net.core.rmem_max.
     const int effective = kernelReported > 0 ? kernelReported / 2 : 0;
-    std::cerr << "UDP INPUT BUFFER 203.63: scope=" << (scope ? scope : "unknown")
+    std::cerr << "UDP INPUT BUFFER 203.64: scope=" << (scope ? scope : "unknown")
               << " requested_bytes=" << kSocketBufferSize
               << " kernel_reported_bytes=" << kernelReported
               << " effective_bytes=" << effective
               << " status=" << (effective >= kSocketBufferSize ? "ok" : "clamped")
               << std::endl;
     if (effective < kSocketBufferSize) {
-        std::cerr << "UDP INPUT BUFFER 203.63: warning=kernel-receive-buffer-clamped"
+        std::cerr << "UDP INPUT BUFFER 203.64: warning=kernel-receive-buffer-clamped"
                   << " effective_bytes=" << effective
                   << " requested_bytes=" << kSocketBufferSize
                   << " hint=raise-net.core.rmem_max" << std::endl;

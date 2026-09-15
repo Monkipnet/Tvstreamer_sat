@@ -216,7 +216,7 @@ struct StreamState {
     // and per-thread malloc arenas from retaining thousands of hot-path chunks.
     std::vector<uint8_t> inputTsScratch;
     std::mutex inputContinuityMutex;
-    // 203.63: transport bytes are not proof of useful media. SRT-CBR can
+    // 203.64: transport bytes are not proof of useful media. SRT-CBR can
     // remain perfectly alive while carrying only NULL/PSI after an upstream
     // UDP outage. Discover input audio/video PIDs from PAT/PMT and count
     // their packets independently so the watchdog can distinguish transport
