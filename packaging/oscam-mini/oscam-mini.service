@@ -2,6 +2,7 @@
 Description=TVStreammerSAT5 OSCam-mini Newcamd/Phoenix server
 After=network.target
 Conflicts=oscam.service
+ConditionPathExists=/opt/TVStreammerSAT5/oscam-mini/config/oscam.conf
 
 [Service]
 Type=simple

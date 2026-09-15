@@ -36,6 +36,9 @@ constexpr uint64_t kStartupReservoirMilliseconds = 1500ULL;
 constexpr std::size_t kMaximumBufferedBytes = 16U * 1024U * 1024U;
 constexpr uint64_t kNanosecondsPerSecond = 1000000000ULL;
 constexpr uint64_t kLateResetIntervals = 4ULL;
+// 203.62 diagnostic threshold: avoid logging harmless single scheduler gaps,
+// but make sustained NULL-fill visible in journald for post-mortem analysis.
+constexpr uint64_t kUnderflowLogThresholdMilliseconds = 500ULL;
 
 uint64_t monotonicNanoseconds() {
     timespec now {};
@@ -268,8 +271,42 @@ private:
                     gst_app_src_end_of_stream(appSrc);
                     break;
                 }
+                const uint64_t gapNow = monotonicNanoseconds();
+                if (underflowStartedNanoseconds == 0) {
+                    underflowStartedNanoseconds = gapNow;
+                    underflowStartChunk = underflowChunks;
+                    underflowLogged = false;
+                }
                 fillNullChunk(chunk, nullContinuity);
                 ++underflowChunks;
+                const uint64_t gapMilliseconds =
+                    (gapNow - underflowStartedNanoseconds) / 1000000ULL;
+                if (!underflowLogged && gapMilliseconds >= kUnderflowLogThresholdMilliseconds) {
+                    underflowLogged = true;
+                    std::cerr << "NETUP output reservoir 203.62: stream=" << streamId
+                              << " type=" << outputType
+                              << " event=underflow-null-fill"
+                              << " gap_ms=" << gapMilliseconds
+                              << " target_bitrate=" << targetBitrate
+                              << " action=keep-cbr-with-null-ts"
+                              << std::endl;
+                }
+            } else if (underflowStartedNanoseconds != 0) {
+                const uint64_t recoveredAt = monotonicNanoseconds();
+                const uint64_t gapMilliseconds =
+                    (recoveredAt - underflowStartedNanoseconds) / 1000000ULL;
+                if (underflowLogged) {
+                    std::cerr << "NETUP output reservoir 203.62: stream=" << streamId
+                              << " type=" << outputType
+                              << " event=underflow-recovered"
+                              << " gap_ms=" << gapMilliseconds
+                              << " null_chunks=" << (underflowChunks - underflowStartChunk)
+                              << " action=resume-upstream-ts"
+                              << std::endl;
+                }
+                underflowStartedNanoseconds = 0;
+                underflowStartChunk = 0;
+                underflowLogged = false;
             }
 
             GstBuffer* output = gst_buffer_new_allocate(nullptr, kChunkBytes, nullptr);
@@ -311,6 +348,9 @@ private:
     bool stopping = false;
     bool upstreamEnded = false;
     uint64_t underflowChunks = 0;
+    uint64_t underflowStartedNanoseconds = 0;
+    uint64_t underflowStartChunk = 0;
+    bool underflowLogged = false;
     std::thread senderThread;
 };
 

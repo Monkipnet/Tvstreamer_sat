@@ -6408,32 +6408,29 @@ bool StreamManager::waitForStreamTeardown(
     }
 
     streamStartWaitCount.fetch_add(1, std::memory_order_relaxed);
-    std::cerr << "STREAM START BARRIER 202.70: stream=" << id
+    std::cerr << "STREAM START BARRIER 203.62: stream=" << id
               << " action=wait-for-old-teardown timeout_ms=" << timeout.count()
               << std::endl;
     const bool complete = streamLifecycleCondition.wait_for(lock, timeout, [this, &id]() {
         return !stoppingStreamIds.count(id);
     });
     if (!complete) {
-        // 202.70: never clear the barrier while the previous GStreamer object
-        // is still alive. 202.65 proved that doing so creates one hidden
-        // pipeline per force-retire and turns the retained objects into a
-        // linear RSS/heap leak. Keep the id reserved and replace the whole
-        // process through systemd; configured streams will be rebuilt from a
-        // clean GStreamer/allocator state by the new process.
+        // 203.62: the old generation still owns the id, therefore starting a
+        // second pipeline would be unsafe. Keep the barrier reserved, reject
+        // only this start attempt, and let the teardown worker finish. A start
+        // barrier timeout by itself is not proof that the process is damaged
+        // and must never restart every unrelated stream in the service.
         streamStartWaitTimeoutCount.fetch_add(1, std::memory_order_relaxed);
         if (error) {
-            *error = "old stream teardown is stuck; automatic service restart scheduled: " + id;
+            *error = "old stream teardown still in progress; start deferred: " + id;
         }
-        std::cerr << "STREAM START BARRIER 202.70: stream=" << id
-                  << " result=timeout action=schedule-systemd-restart start_allowed=no"
-                  << std::endl;
-        lock.unlock();
-        scheduleAutomaticServiceRestart(id, "start-barrier-timeout");
+        std::cerr << "STREAM START BARRIER 203.62: stream=" << id
+                  << " result=timeout action=keep-old-teardown-no-service-restart"
+                  << " start_allowed=no" << std::endl;
         return false;
     }
 
-    std::cerr << "STREAM START BARRIER 202.70: stream=" << id
+    std::cerr << "STREAM START BARRIER 203.62: stream=" << id
               << " result=old-instance-cleaned action=start-allowed" << std::endl;
     return true;
 }
@@ -6472,26 +6469,38 @@ bool StreamManager::teardownStreamState(
     // before touching pipeline state. The NULL transition itself runs behind a
     // hard watchdog because network source plugins can block inside
     // gst_element_set_state() before it returns.
+    std::cerr << "STREAM TEARDOWN 203.62: stream=" << id
+              << " stage=begin" << std::endl;
     if (state.pipeline) {
         detachAppSinkCallbacksForTeardown(state.pipeline);
     }
     if (state.bus) {
         gst_bus_set_flushing(state.bus, TRUE);
     }
+    std::cerr << "STREAM TEARDOWN 203.62: stream=" << id
+              << " stage=protocol-input-output-stop begin" << std::endl;
     stopDurationHlsSchedulerForTeardown(state.pipeline, id);
     stopHttpMpegTsInput(&state);
     stopExternalSrtOutputs(&state);
     releaseSharedDvbInput(&state);
+    std::cerr << "STREAM TEARDOWN 203.62: stream=" << id
+              << " stage=protocol-input-output-stop complete" << std::endl;
     if (state.bus) {
         gst_bus_set_flushing(state.bus, TRUE);
     }
+    std::cerr << "STREAM TEARDOWN 203.62: stream=" << id
+              << " stage=bus-thread-stop begin" << std::endl;
     if (state.busThread.joinable()) {
         state.busThread.join();
     }
+    std::cerr << "STREAM TEARDOWN 203.62: stream=" << id
+              << " stage=bus-thread-stop complete" << std::endl;
     if (state.gstTranscoder) {
         state.gstTranscoder->stop();
         state.gstTranscoder.reset();
     }
+    std::cerr << "STREAM TEARDOWN 203.62: stream=" << id
+              << " stage=null-transition begin" << std::endl;
     if (state.pipeline && !transitionPipelineToNullBounded(
             state.pipeline,
             std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -6510,6 +6519,8 @@ bool StreamManager::teardownStreamState(
         statePtr.release();
         return false;
     }
+    std::cerr << "STREAM TEARDOWN 203.62: stream=" << id
+              << " stage=null-transition complete" << std::endl;
 
     // These contexts own request-pad references and are used as signal callback
     // user-data. Disconnect those handlers first, then release the pad/context
@@ -6533,6 +6544,8 @@ bool StreamManager::teardownStreamState(
     }
 
     bool finalized = true;
+    std::cerr << "STREAM TEARDOWN 203.62: stream=" << id
+              << " stage=pipeline-finalize begin" << std::endl;
     if (state.pipeline) {
         finalized = releasePipelineAndWaitForFinalize(
             state.pipeline, id, std::chrono::seconds(10));
@@ -6541,6 +6554,9 @@ bool StreamManager::teardownStreamState(
             scheduleAutomaticServiceRestart(id, "pipeline-finalize-timeout");
         }
     }
+    std::cerr << "STREAM TEARDOWN 203.62: stream=" << id
+              << " stage=pipeline-finalize result=" << (finalized ? "complete" : "timeout")
+              << std::endl;
 
     trimReleasedPipelineMemory();
     tvs::protocols::removeFifoRelay(stoppedConfig);
@@ -6557,8 +6573,8 @@ bool StreamManager::teardownStreamState(
     }
 
     if (finalized) {
-        std::cerr << "STREAM TEARDOWN 202.66: stream=" << id
-                  << " result=finalized action=release-start-barrier" << std::endl;
+        std::cerr << "STREAM TEARDOWN 203.62: stream=" << id
+                  << " stage=complete result=finalized action=release-start-barrier" << std::endl;
     }
     return finalized;
 }
@@ -6580,8 +6596,9 @@ bool StreamManager::cleanupStreamState(const std::string& id, bool notifyManualS
                         return !stoppingStreamIds.count(id);
                     });
                 if (!complete) {
-                    lock.unlock();
-                    scheduleAutomaticServiceRestart(id, "synchronous-stop-barrier-timeout");
+                    std::cerr << "STREAM START BARRIER 203.62: stream=" << id
+                              << " result=timeout action=keep-old-teardown-no-service-restart"
+                              << " context=synchronous-stop start_allowed=no" << std::endl;
                 }
                 return complete;
             }
