@@ -216,6 +216,24 @@ struct StreamState {
     // and per-thread malloc arenas from retaining thousands of hot-path chunks.
     std::vector<uint8_t> inputTsScratch;
     std::mutex inputContinuityMutex;
+    // 203.63: transport bytes are not proof of useful media. SRT-CBR can
+    // remain perfectly alive while carrying only NULL/PSI after an upstream
+    // UDP outage. Discover input audio/video PIDs from PAT/PMT and count
+    // their packets independently so the watchdog can distinguish transport
+    // activity from real media progress.
+    std::atomic<uint64_t> inputTsMediaPackets{0};
+    std::atomic<uint64_t> inputTsNullPackets{0};
+    std::atomic<uint64_t> inputTsMediaPesStarts{0};
+    std::vector<uint8_t> inputMediaRemainder;
+    std::vector<uint8_t> inputMediaScratch;
+    std::mutex inputMediaMutex;
+    uint16_t inputTelemetryPmtPid = 0x1FFF;
+    std::array<bool, 8192> inputTelemetryMediaPids {};
+    bool inputTelemetryMediaPidsKnown = false;
+    uint64_t lastInputMediaPacketsSeen = 0;
+    uint64_t lastOutputMediaPacketsSeen = 0;
+    std::chrono::steady_clock::time_point lastInputMediaActivity = std::chrono::steady_clock::now();
+    std::chrono::steady_clock::time_point lastOutputMediaActivity = std::chrono::steady_clock::now();
     std::array<uint8_t, 8192> outputContinuity {};
     std::array<bool, 8192> outputContinuityValid {};
     std::vector<uint8_t> outputTsRemainder;

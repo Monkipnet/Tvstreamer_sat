@@ -23,6 +23,41 @@ namespace {
 
 constexpr gint kSocketBufferSize = 16 * 1024 * 1024;
 
+void logUdpReceiveBuffer20363(GSocket* socket, const char* scope) {
+#if defined(__linux__)
+    if (!socket) return;
+    const int fd = g_socket_get_fd(socket);
+    int kernelReported = 0;
+    socklen_t length = sizeof(kernelReported);
+    if (::getsockopt(fd, SOL_SOCKET, SO_RCVBUF, &kernelReported, &length) != 0) {
+        std::cerr << "UDP INPUT BUFFER 203.63: scope=" << (scope ? scope : "unknown")
+                  << " requested_bytes=" << kSocketBufferSize
+                  << " actual=unknown errno=" << errno
+                  << " error=\"" << std::strerror(errno) << "\"" << std::endl;
+        return;
+    }
+    // Linux reports twice the user-visible SO_RCVBUF value because the kernel
+    // accounts bookkeeping overhead internally. Divide by two for a practical
+    // comparison with the requested buffer and net.core.rmem_max.
+    const int effective = kernelReported > 0 ? kernelReported / 2 : 0;
+    std::cerr << "UDP INPUT BUFFER 203.63: scope=" << (scope ? scope : "unknown")
+              << " requested_bytes=" << kSocketBufferSize
+              << " kernel_reported_bytes=" << kernelReported
+              << " effective_bytes=" << effective
+              << " status=" << (effective >= kSocketBufferSize ? "ok" : "clamped")
+              << std::endl;
+    if (effective < kSocketBufferSize) {
+        std::cerr << "UDP INPUT BUFFER 203.63: warning=kernel-receive-buffer-clamped"
+                  << " effective_bytes=" << effective
+                  << " requested_bytes=" << kSocketBufferSize
+                  << " hint=raise-net.core.rmem_max" << std::endl;
+    }
+#else
+    (void)socket;
+    (void)scope;
+#endif
+}
+
 bool isMulticastHost(const std::string& host) {
     static const std::regex pattern(R"(^((22[4-9])|(23[0-9]))\.)");
     return std::regex_search(host, pattern);
@@ -215,6 +250,7 @@ GSocket* createDeviceBoundUnicastSocket(
                   << gErrorMessage("failed to set unicast receive buffer", socketError)
                   << std::endl;
     }
+    logUdpReceiveBuffer20363(socket, "unicast-device-bound");
 
     boundDevice = selected.name;
     return socket;
@@ -362,6 +398,7 @@ GSocket* createMulticastSocket(
                   << gErrorMessage("failed to set multicast receive buffer", socketError)
                   << std::endl;
     }
+    logUdpReceiveBuffer20363(socket, "multicast");
     return socket;
 }
 

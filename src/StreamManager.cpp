@@ -102,6 +102,12 @@ constexpr auto kSrtSourceReconnectGrace = std::chrono::seconds(4);
 constexpr auto kSrtFullRebuildDelay = std::chrono::seconds(8);
 // Keep the older generic network rebuild window for non-SRT lifecycle helpers.
 constexpr auto kNetworkNoInputRebuildDelay = std::chrono::seconds(12);
+// 203.63: a live transport can still be useless media (for example an SRT-CBR
+// sender padding an upstream UDP outage with PID 0x1fff).  Do not rebuild on
+// NULL-fill alone.  Rebuild only when real input media packets are arriving but
+// the normalized/remapped output media has made no progress for this interval.
+constexpr auto kMediaPipelineStallDelay = std::chrono::seconds(5);
+constexpr auto kMediaPipelineRecoveryCooldown = std::chrono::seconds(15);
 // HTTP MPEG-TS origins can pause delivery while keeping the connection alive.
 // Give the existing pipeline time to recover instead of creating an avoidable
 // audio/video discontinuity during a short upstream stall.
@@ -4083,6 +4089,148 @@ void discoverOutputMediaPids(const uint8_t* packet, StreamState* state) {
     if (mediaCount > 0) {
         state->outputTelemetryMediaPids = discovered;
         state->outputTelemetryMediaPidsKnown = true;
+    }
+}
+
+
+struct InputMediaCount {
+    uint64_t mediaPackets = 0;
+    uint64_t nullPackets = 0;
+    uint64_t mediaPesStarts = 0;
+};
+
+void seedConfiguredInputMediaPids(StreamState* state) {
+    if (!state || state->inputTelemetryMediaPidsKnown) return;
+    if (state->config.videoPid > 0 && state->config.videoPid < 0x1FFF)
+        state->inputTelemetryMediaPids[state->config.videoPid] = true;
+    if (state->config.audioPid > 0 && state->config.audioPid < 0x1FFF)
+        state->inputTelemetryMediaPids[state->config.audioPid] = true;
+}
+
+void discoverInputMediaPids(const uint8_t* packet, StreamState* state) {
+    if (!packet || !state || packet[0] != 0x47) return;
+    const uint16_t pid = static_cast<uint16_t>(((packet[1] & 0x1F) << 8) | packet[2]);
+    size_t available = 0;
+    const uint8_t* section = tsSectionStart(packet, available);
+    if (!section || available < 8) return;
+
+    if (pid == 0x0000 && section[0] == 0x00) {
+        const size_t sectionLength = static_cast<size_t>(((section[1] & 0x0F) << 8) | section[2]);
+        const size_t total = 3 + sectionLength;
+        if (sectionLength < 9 || total > available) return;
+        const size_t entriesEnd = total - 4;
+        for (size_t pos = 8; pos + 4 <= entriesEnd; pos += 4) {
+            const uint16_t program = static_cast<uint16_t>((section[pos] << 8) | section[pos + 1]);
+            const uint16_t mappedPid = static_cast<uint16_t>(((section[pos + 2] & 0x1F) << 8) | section[pos + 3]);
+            if (program != 0 && mappedPid > 0 && mappedPid < 0x1FFF) {
+                state->inputTelemetryPmtPid = mappedPid;
+                break;
+            }
+        }
+        return;
+    }
+
+    if (pid != state->inputTelemetryPmtPid || section[0] != 0x02) return;
+    const size_t sectionLength = static_cast<size_t>(((section[1] & 0x0F) << 8) | section[2]);
+    const size_t total = 3 + sectionLength;
+    if (sectionLength < 13 || total > available) return;
+    const size_t end = total - 4;
+    const size_t programInfoLength = static_cast<size_t>(((section[10] & 0x0F) << 8) | section[11]);
+    if (12 + programInfoLength > end) return;
+
+    std::array<bool, 8192> discovered {};
+    size_t mediaCount = 0;
+    size_t pos = 12 + programInfoLength;
+    while (pos + 5 <= end) {
+        const uint8_t streamType = section[pos];
+        const uint16_t elementaryPid = static_cast<uint16_t>(((section[pos + 1] & 0x1F) << 8) | section[pos + 2]);
+        const size_t esInfoLength = static_cast<size_t>(((section[pos + 3] & 0x0F) << 8) | section[pos + 4]);
+        if (pos + 5 + esInfoLength > end) break;
+        const uint8_t* descriptors = section + pos + 5;
+        if (elementaryPid < 0x1FFF &&
+            (isVideoStreamType(streamType) || isAudioStreamType(streamType, descriptors, esInfoLength))) {
+            discovered[elementaryPid] = true;
+            ++mediaCount;
+        }
+        pos += 5 + esInfoLength;
+    }
+    if (mediaCount > 0) {
+        state->inputTelemetryMediaPids = discovered;
+        state->inputTelemetryMediaPidsKnown = true;
+    }
+}
+
+InputMediaCount countInputMedia(const guint8* data, std::size_t size, StreamState* state) {
+    InputMediaCount count;
+    if (!data || size == 0 || !state) return count;
+    std::lock_guard<std::mutex> lock(state->inputMediaMutex);
+    seedConfiguredInputMediaPids(state);
+
+    auto& bytes = state->inputMediaScratch;
+    bytes.clear();
+    const std::size_t required = state->inputMediaRemainder.size() + size;
+    if (bytes.capacity() < required) bytes.reserve(required);
+    bytes.insert(bytes.end(), state->inputMediaRemainder.begin(), state->inputMediaRemainder.end());
+    bytes.insert(bytes.end(), data, data + size);
+    state->inputMediaRemainder.clear();
+
+    const std::size_t start = findTsAlignment(bytes.data(), bytes.size());
+    if (start == std::string::npos) {
+        const std::size_t keep = std::min<std::size_t>(bytes.size(), kTsPacketSize * 4 - 1);
+        state->inputMediaRemainder.assign(bytes.end() - keep, bytes.end());
+        return count;
+    }
+
+    std::size_t offset = start;
+    for (; offset + kTsPacketSize <= bytes.size(); offset += kTsPacketSize) {
+        const guint8* packet = bytes.data() + offset;
+        if (packet[0] != 0x47) break;
+        if ((packet[1] & 0x80) != 0) continue;
+        discoverInputMediaPids(packet, state);
+        const uint16_t pid = static_cast<uint16_t>(((packet[1] & 0x1F) << 8) | packet[2]);
+        if (pid == 0x1FFF) {
+            ++count.nullPackets;
+            continue;
+        }
+        if (pid >= state->inputTelemetryMediaPids.size() || !state->inputTelemetryMediaPids[pid]) continue;
+        const guint8 adaptationControl = static_cast<guint8>((packet[3] >> 4) & 0x03);
+        if (adaptationControl != 1 && adaptationControl != 3) continue;
+        ++count.mediaPackets;
+        if ((packet[1] & 0x40) != 0 && ((packet[3] >> 6) & 0x03) == 0) {
+            const size_t payloadOffset = tsPayloadOffset(packet);
+            if (payloadOffset + 3 <= kTsPacketSize &&
+                packet[payloadOffset] == 0x00 && packet[payloadOffset + 1] == 0x00 && packet[payloadOffset + 2] == 0x01) {
+                ++count.mediaPesStarts;
+            }
+        }
+    }
+
+    if (offset < bytes.size()) {
+        state->inputMediaRemainder.assign(bytes.begin() + offset, bytes.end());
+        if (state->inputMediaRemainder.size() > kTsPacketSize * 4) {
+            state->inputMediaRemainder.erase(
+                state->inputMediaRemainder.begin(),
+                state->inputMediaRemainder.end() - (kTsPacketSize * 4));
+        }
+    }
+    return count;
+}
+
+void updateInputMediaStats(StreamState* state, GstBuffer* buffer) {
+    if (!state || !buffer) return;
+    GstMapInfo map {};
+    if (!gst_buffer_map(buffer, &map, GST_MAP_READ)) return;
+    const auto count = countInputMedia(map.data, map.size, state);
+    gst_buffer_unmap(buffer, &map);
+    if (count.mediaPackets) state->inputTsMediaPackets.fetch_add(count.mediaPackets, std::memory_order_relaxed);
+    if (count.nullPackets) state->inputTsNullPackets.fetch_add(count.nullPackets, std::memory_order_relaxed);
+    if (count.mediaPesStarts) state->inputTsMediaPesStarts.fetch_add(count.mediaPesStarts, std::memory_order_relaxed);
+}
+
+void updateInputMediaStats(StreamState* state, GstBufferList* list) {
+    if (!state || !list) return;
+    for (guint i = 0; i < gst_buffer_list_length(list); ++i) {
+        updateInputMediaStats(state, gst_buffer_list_get(list, i));
     }
 }
 
@@ -10409,11 +10557,13 @@ GstPadProbeReturn StreamManager::inputPadProbe(GstPad* pad, GstPadProbeInfo* inf
         if (buffer) {
             state->inputBytes.fetch_add(gst_buffer_get_size(buffer), std::memory_order_relaxed);
             updateInputContinuityErrors(state, buffer);
+            updateInputMediaStats(state, buffer);
         }
     } else if (info->type & GST_PAD_PROBE_TYPE_BUFFER_LIST) {
         GstBufferList* list = gst_pad_probe_info_get_buffer_list(info);
         state->inputBytes.fetch_add(bufferListSize(list), std::memory_order_relaxed);
         updateInputContinuityErrors(state, list);
+        updateInputMediaStats(state, list);
     }
 
     return GST_PAD_PROBE_OK;
@@ -10659,6 +10809,21 @@ void StreamManager::monitorBus(const std::string& id) {
                   << std::endl;
     }
 
+    if (!state->config.transcodeEnabled && state->config.remapEnabled &&
+        (configuredInputKind == tvs::stream_protocols::InputProtocolKind::Srt ||
+         configuredInputKind == tvs::stream_protocols::InputProtocolKind::Udp ||
+         configuredInputKind == tvs::stream_protocols::InputProtocolKind::Rtp)) {
+        std::cerr << "MEDIA WATCH 203.63: stream=" << id
+                  << " protocol=" << tvs::stream_protocols::inputKindName(configuredInputKind)
+                  << " transport_counter=input-bytes"
+                  << " media_counter=pat-pmt-audio-video-pids"
+                  << " output_counter=normalized-media-pids"
+                  << " stall_ms="
+                  << std::chrono::duration_cast<std::chrono::milliseconds>(
+                         kMediaPipelineStallDelay).count()
+                  << " recovery=full-pipeline-this-stream-only" << std::endl;
+    }
+
     bool networkRecoveryPending = false;
     bool networkLossWarningActive = false;
     bool networkGraceSuppressionLogged = false;
@@ -10668,6 +10833,8 @@ void StreamManager::monitorBus(const std::string& id) {
     auto transcoderAutoRestartDue = std::chrono::steady_clock::time_point::min();
     int lastHlsSourceUnavailableStatus = 0;
     bool hlsBufferedAheadSuppressionLogged = false;
+    bool mediaTransportOnlyLogged = false;
+    auto lastMediaPipelineRecovery = std::chrono::steady_clock::time_point::min();
 
     while (state->running.load()) {
         const auto now = std::chrono::steady_clock::now();
@@ -11181,6 +11348,105 @@ void StreamManager::monitorBus(const std::string& id) {
             }
         }
         maybeLogSrtInputStats(state, now);
+
+        // 203.63: inputBytes measures transport, not useful media.  A CBR SRT
+        // sender can keep inputBytes moving forever with NULL packets after an
+        // upstream UDP outage. Track discovered input media PIDs independently
+        // and compare them with normalized/remapped output media progress.
+        const uint64_t currentInputMediaPackets =
+            state->inputTsMediaPackets.load(std::memory_order_relaxed);
+        if (currentInputMediaPackets != state->lastInputMediaPacketsSeen) {
+            state->lastInputMediaPacketsSeen = currentInputMediaPackets;
+            state->lastInputMediaActivity = now;
+        }
+        const uint64_t currentOutputMediaPackets =
+            state->outputTsPayloadPackets.load(std::memory_order_relaxed);
+        if (currentOutputMediaPackets != state->lastOutputMediaPacketsSeen) {
+            state->lastOutputMediaPacketsSeen = currentOutputMediaPackets;
+            state->lastOutputMediaActivity = now;
+        }
+
+        const bool udpLikeInput =
+            activeInputKind == tvs::stream_protocols::InputProtocolKind::Udp ||
+            activeInputKind == tvs::stream_protocols::InputProtocolKind::Rtp;
+        const bool mediaWatchEligible =
+            !state->config.testPattern && !state->config.transcodeEnabled &&
+            state->config.remapEnabled && (srtInput || udpLikeInput);
+        const bool transportRecent =
+            now - state->lastInputActivity < std::chrono::seconds(2);
+        const bool inputMediaSeen = currentInputMediaPackets > 0;
+        const bool inputMediaRecent =
+            inputMediaSeen && now - state->lastInputMediaActivity < std::chrono::seconds(2);
+        const auto inputMediaGap = now - state->lastInputMediaActivity;
+        const auto outputMediaGap = now - state->lastOutputMediaActivity;
+
+        if (mediaWatchEligible && transportRecent &&
+            inputMediaGap >= kMediaPipelineStallDelay && !mediaTransportOnlyLogged) {
+            mediaTransportOnlyLogged = true;
+            std::cerr << "MEDIA WATCH 203.63: stream=" << id
+                      << " state=transport-alive-media-missing"
+                      << " input_media_gap_ms="
+                      << std::chrono::duration_cast<std::chrono::milliseconds>(inputMediaGap).count()
+                      << " null_packets="
+                      << state->inputTsNullPackets.load(std::memory_order_relaxed)
+                      << " action=hold-transport-no-rebuild" << std::endl;
+        }
+        if (mediaTransportOnlyLogged && inputMediaRecent) {
+            mediaTransportOnlyLogged = false;
+            std::cerr << "MEDIA WATCH 203.63: stream=" << id
+                      << " state=media-returned"
+                      << " output_media_gap_ms="
+                      << std::chrono::duration_cast<std::chrono::milliseconds>(outputMediaGap).count()
+                      << " action=verify-remap-progress" << std::endl;
+        }
+
+        const bool mediaPipelineStalled =
+            mediaWatchEligible && transportRecent && inputMediaRecent &&
+            outputMediaGap >= kMediaPipelineStallDelay &&
+            (lastMediaPipelineRecovery == std::chrono::steady_clock::time_point::min() ||
+             now - lastMediaPipelineRecovery >= kMediaPipelineRecoveryCooldown);
+        if (mediaPipelineStalled) {
+            const std::string recoveryUri = state->activeInputUri.empty()
+                ? state->primaryInputUri : state->activeInputUri;
+            const bool recoverBackup = state->usingBackup;
+            std::cerr << "MEDIA STALL RECOVERY 203.63: stream=" << id
+                      << " protocol=" << tvs::stream_protocols::inputKindName(activeInputKind)
+                      << " reason=input-media-progress-output-media-stalled"
+                      << " input_media_packets=" << currentInputMediaPackets
+                      << " output_media_packets=" << currentOutputMediaPackets
+                      << " output_gap_ms="
+                      << std::chrono::duration_cast<std::chrono::milliseconds>(outputMediaGap).count()
+                      << " action=full-pipeline-rebuild-only-this-stream" << std::endl;
+            lastMediaPipelineRecovery = now;
+            if (!recoveryUri.empty() && restartActiveInput(state, recoveryUri, recoverBackup)) {
+                bus = state->bus;
+                state->lastInputMediaPacketsSeen =
+                    state->inputTsMediaPackets.load(std::memory_order_relaxed);
+                state->lastOutputMediaPacketsSeen =
+                    state->outputTsPayloadPackets.load(std::memory_order_relaxed);
+                state->lastInputMediaActivity = now;
+                state->lastOutputMediaActivity = now;
+                state->lastInputActivity = now;
+                state->lastInputBytesSeen =
+                    state->inputBytes.load(std::memory_order_relaxed);
+                mediaTransportOnlyLogged = false;
+                networkRecoveryPending = false;
+                networkRecoveryAttempts = 0;
+                networkRecoveryDue = std::chrono::steady_clock::time_point::min();
+                state->statusMessage = "media pipeline recovered";
+                state->active = true;
+                std::cerr << "MEDIA STALL RECOVERY 203.63: stream=" << id
+                          << " result=rebuild-started" << std::endl;
+                continue;
+            }
+            bus = state->bus;
+            state->active = true;
+            std::cerr << "MEDIA STALL RECOVERY 203.63: stream=" << id
+                      << " result=rebuild-failed cooldown_ms="
+                      << std::chrono::duration_cast<std::chrono::milliseconds>(
+                             kMediaPipelineRecoveryCooldown).count()
+                      << std::endl;
+        }
 
         if (!state->config.testPattern) {
             const bool waitingForFirstSrtMedia =
