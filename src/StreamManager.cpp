@@ -114,6 +114,15 @@ constexpr auto kMediaPipelineRecoveryCooldown = std::chrono::seconds(15);
 // When real media returns, rebuild this stream exactly once to discard stale
 // demux/remap/reservoir state and start a clean TS epoch.
 constexpr auto kMediaOutageEpochDelay = std::chrono::seconds(5);
+// 203.66: final-output health is sampled after the NETUP reservoir pacer.  A
+// live input carrying real A/V must never be allowed to leave the network
+// branch as an almost-all-NULL transport indefinitely.  Wait through normal
+// startup/transient reservoir drain, then rebuild only this stream if that
+// exact final branch remains >=98% NULL with no real media for three seconds.
+constexpr auto kFinalTsStartupGrace = std::chrono::seconds(8);
+constexpr auto kFinalTsNullOnlyFaultDelay = std::chrono::seconds(3);
+constexpr auto kFinalTsRecoveryCooldown = std::chrono::seconds(15);
+constexpr double kFinalTsNullOnlyRatio = 0.98;
 // 203.64: after a long media gap, allow the remap/demux branch a short chance
 // to resume output before declaring the already-established output stalled.
 constexpr auto kMediaReturnOutputGrace = std::chrono::seconds(2);
@@ -4241,6 +4250,259 @@ void updateInputMediaStats(StreamState* state, GstBufferList* list) {
     for (guint i = 0; i < gst_buffer_list_length(list); ++i) {
         updateInputMediaStats(state, gst_buffer_list_get(list, i));
     }
+}
+
+// 203.66: inspect the exact MPEG-TS emitted by each NETUP reservoir, not the
+// common pre-branch transport. This is the only point that can distinguish a
+// healthy input from a final SRT/HTTP branch that has become permanently
+// NULL-only after an upstream/remap/reservoir fault.
+struct FinalNetupTsProbeContext {
+    std::shared_ptr<FinalNetupTsHealth> health;
+    uint16_t pmtPid = 0x1FFF;
+    std::array<bool, 8192> mediaPids {};
+    bool mediaPidsKnown = false;
+    std::vector<guint8> remainder;
+    std::vector<guint8> scratch;
+};
+
+uint64_t steadyClockNanoseconds20366() {
+    return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count());
+}
+
+bool packetCarriesPcr20366(const guint8* packet) {
+    if (!packet || packet[0] != 0x47) return false;
+    const guint8 adaptationControl = static_cast<guint8>((packet[3] >> 4) & 0x03U);
+    if (adaptationControl != 2 && adaptationControl != 3) return false;
+    const std::size_t adaptationLength = packet[4];
+    if (adaptationLength < 7 || 5 + adaptationLength > kTsPacketSize) return false;
+    return (packet[5] & 0x10U) != 0;
+}
+
+void discoverFinalNetupMediaPids20366(
+    const guint8* packet, FinalNetupTsProbeContext* context,
+    bool& patSeen, bool& pmtSeen) {
+    if (!packet || !context || packet[0] != 0x47) return;
+    const uint16_t pid = static_cast<uint16_t>(((packet[1] & 0x1FU) << 8) | packet[2]);
+    std::size_t available = 0;
+    const guint8* section = tsSectionStart(packet, available);
+    if (!section || available < 8) return;
+
+    if (pid == 0x0000 && section[0] == 0x00) {
+        patSeen = true;
+        const std::size_t sectionLength = static_cast<std::size_t>(
+            ((section[1] & 0x0FU) << 8) | section[2]);
+        const std::size_t total = 3 + sectionLength;
+        if (sectionLength < 9 || total > available) return;
+        const std::size_t entriesEnd = total - 4;
+        for (std::size_t pos = 8; pos + 4 <= entriesEnd; pos += 4) {
+            const uint16_t program = static_cast<uint16_t>((section[pos] << 8) | section[pos + 1]);
+            const uint16_t mappedPid = static_cast<uint16_t>(
+                ((section[pos + 2] & 0x1FU) << 8) | section[pos + 3]);
+            if (program != 0 && mappedPid > 0 && mappedPid < 0x1FFF) {
+                context->pmtPid = mappedPid;
+                break;
+            }
+        }
+        return;
+    }
+
+    if (pid != context->pmtPid || section[0] != 0x02) return;
+    pmtSeen = true;
+    const std::size_t sectionLength = static_cast<std::size_t>(
+        ((section[1] & 0x0FU) << 8) | section[2]);
+    const std::size_t total = 3 + sectionLength;
+    if (sectionLength < 13 || total > available) return;
+    const std::size_t end = total - 4;
+    const std::size_t programInfoLength = static_cast<std::size_t>(
+        ((section[10] & 0x0FU) << 8) | section[11]);
+    if (12 + programInfoLength > end) return;
+
+    bool discoveredAny = false;
+    std::size_t pos = 12 + programInfoLength;
+    while (pos + 5 <= end) {
+        const guint8 streamType = section[pos];
+        const uint16_t elementaryPid = static_cast<uint16_t>(
+            ((section[pos + 1] & 0x1FU) << 8) | section[pos + 2]);
+        const std::size_t esInfoLength = static_cast<std::size_t>(
+            ((section[pos + 3] & 0x0FU) << 8) | section[pos + 4]);
+        if (pos + 5 + esInfoLength > end) break;
+        const guint8* descriptors = section + pos + 5;
+        if (elementaryPid < 0x1FFF &&
+            (isVideoStreamType(streamType) ||
+             isAudioStreamType(streamType, descriptors, esInfoLength))) {
+            context->mediaPids[elementaryPid] = true;
+            discoveredAny = true;
+        }
+        pos += 5 + esInfoLength;
+    }
+    if (discoveredAny) context->mediaPidsKnown = true;
+}
+
+void updateFinalNetupTsHealth20366(
+    FinalNetupTsProbeContext* context, const guint8* data, std::size_t size) {
+    if (!context || !context->health || !data || size == 0) return;
+
+    auto& bytes = context->scratch;
+    bytes.clear();
+    const std::size_t required = context->remainder.size() + size;
+    if (bytes.capacity() < required) bytes.reserve(required);
+    bytes.insert(bytes.end(), context->remainder.begin(), context->remainder.end());
+    bytes.insert(bytes.end(), data, data + size);
+    context->remainder.clear();
+
+    const std::size_t start = findTsAlignment(bytes.data(), bytes.size());
+    if (start == std::string::npos) {
+        const std::size_t keep = std::min<std::size_t>(bytes.size(), kTsPacketSize * 4 - 1);
+        context->remainder.assign(bytes.end() - keep, bytes.end());
+        return;
+    }
+
+    uint64_t totalPackets = 0;
+    uint64_t nullPackets = 0;
+    uint64_t mediaPackets = 0;
+    uint64_t patPackets = 0;
+    uint64_t pmtPackets = 0;
+    uint64_t pcrPackets = 0;
+
+    std::size_t offset = start;
+    for (; offset + kTsPacketSize <= bytes.size(); offset += kTsPacketSize) {
+        const guint8* packet = bytes.data() + offset;
+        if (packet[0] != 0x47) break;
+        if ((packet[1] & 0x80U) != 0) continue;
+        ++totalPackets;
+
+        bool patSeen = false;
+        bool pmtSeen = false;
+        discoverFinalNetupMediaPids20366(packet, context, patSeen, pmtSeen);
+        if (patSeen) ++patPackets;
+        if (pmtSeen) ++pmtPackets;
+        if (packetCarriesPcr20366(packet)) ++pcrPackets;
+
+        const uint16_t pid = static_cast<uint16_t>(((packet[1] & 0x1FU) << 8) | packet[2]);
+        if (pid == 0x1FFF) {
+            ++nullPackets;
+            continue;
+        }
+        if (pid < context->mediaPids.size() && context->mediaPids[pid]) {
+            const guint8 adaptationControl = static_cast<guint8>((packet[3] >> 4) & 0x03U);
+            if (adaptationControl == 1 || adaptationControl == 3) ++mediaPackets;
+        }
+    }
+
+    if (offset < bytes.size()) {
+        context->remainder.assign(bytes.begin() + static_cast<std::ptrdiff_t>(offset), bytes.end());
+        if (context->remainder.size() > kTsPacketSize * 4) {
+            context->remainder.erase(
+                context->remainder.begin(),
+                context->remainder.end() - static_cast<std::ptrdiff_t>(kTsPacketSize * 4));
+        }
+    }
+
+    if (totalPackets == 0) return;
+    const uint64_t nowNs = steadyClockNanoseconds20366();
+    context->health->totalPackets.fetch_add(totalPackets, std::memory_order_relaxed);
+    context->health->nullPackets.fetch_add(nullPackets, std::memory_order_relaxed);
+    context->health->mediaPackets.fetch_add(mediaPackets, std::memory_order_relaxed);
+    context->health->patPackets.fetch_add(patPackets, std::memory_order_relaxed);
+    context->health->pmtPackets.fetch_add(pmtPackets, std::memory_order_relaxed);
+    context->health->pcrPackets.fetch_add(pcrPackets, std::memory_order_relaxed);
+    context->health->lastPacketNs.store(nowNs, std::memory_order_relaxed);
+    if (mediaPackets) context->health->lastMediaNs.store(nowNs, std::memory_order_relaxed);
+    if (patPackets) context->health->lastPatNs.store(nowNs, std::memory_order_relaxed);
+    if (pmtPackets) context->health->lastPmtNs.store(nowNs, std::memory_order_relaxed);
+    if (pcrPackets) context->health->lastPcrNs.store(nowNs, std::memory_order_relaxed);
+}
+
+GstPadProbeReturn finalNetupTsProbe20366(
+    GstPad*, GstPadProbeInfo* info, gpointer userData) {
+    auto* context = static_cast<FinalNetupTsProbeContext*>(userData);
+    if (!context || !info) return GST_PAD_PROBE_OK;
+    if (info->type & GST_PAD_PROBE_TYPE_BUFFER) {
+        GstBuffer* buffer = gst_pad_probe_info_get_buffer(info);
+        if (buffer) {
+            GstMapInfo map {};
+            if (gst_buffer_map(buffer, &map, GST_MAP_READ)) {
+                updateFinalNetupTsHealth20366(context, map.data, map.size);
+                gst_buffer_unmap(buffer, &map);
+            }
+        }
+    } else if (info->type & GST_PAD_PROBE_TYPE_BUFFER_LIST) {
+        GstBufferList* list = gst_pad_probe_info_get_buffer_list(info);
+        if (list) {
+            const guint count = gst_buffer_list_length(list);
+            for (guint i = 0; i < count; ++i) {
+                GstBuffer* buffer = gst_buffer_list_get(list, i);
+                if (!buffer) continue;
+                GstMapInfo map {};
+                if (gst_buffer_map(buffer, &map, GST_MAP_READ)) {
+                    updateFinalNetupTsHealth20366(context, map.data, map.size);
+                    gst_buffer_unmap(buffer, &map);
+                }
+            }
+        }
+    }
+    return GST_PAD_PROBE_OK;
+}
+
+void attachFinalNetupTsProbe20366(
+    StreamState* state, GstElement* outputQueue, const StreamConfig& cfg,
+    std::size_t branchIndex, const std::string& outputType) {
+    if (!state || !outputQueue) return;
+    GstPad* sinkPad = gst_element_get_static_pad(outputQueue, "sink");
+    if (!sinkPad) {
+        std::cerr << "FINAL TS WATCH 203.66: stream=" << state->config.id
+                  << " branch=" << branchIndex
+                  << " type=" << outputType
+                  << " result=probe-pad-missing" << std::endl;
+        return;
+    }
+
+    auto health = std::make_shared<FinalNetupTsHealth>();
+    health->branchIndex = branchIndex;
+    health->outputType = outputType;
+    auto* context = new FinalNetupTsProbeContext();
+    context->health = health;
+    if (cfg.videoPid > 0 && cfg.videoPid < 0x1FFF) {
+        context->mediaPids[cfg.videoPid] = true;
+        context->mediaPidsKnown = true;
+    }
+    if (cfg.audioPid > 0 && cfg.audioPid < 0x1FFF) {
+        context->mediaPids[cfg.audioPid] = true;
+        context->mediaPidsKnown = true;
+    }
+
+    const gulong probeId = gst_pad_add_probe(
+        sinkPad,
+        static_cast<GstPadProbeType>(GST_PAD_PROBE_TYPE_BUFFER | GST_PAD_PROBE_TYPE_BUFFER_LIST),
+        finalNetupTsProbe20366,
+        context,
+        [](gpointer data) { delete static_cast<FinalNetupTsProbeContext*>(data); });
+    gst_object_unref(sinkPad);
+    if (probeId == 0) {
+        delete context;
+        std::cerr << "FINAL TS WATCH 203.66: stream=" << state->config.id
+                  << " branch=" << branchIndex
+                  << " type=" << outputType
+                  << " result=probe-attach-failed" << std::endl;
+        return;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(state->finalNetupTsHealthMutex);
+        auto& branches = state->finalNetupTsHealth;
+        branches.erase(std::remove_if(branches.begin(), branches.end(),
+            [branchIndex](const std::shared_ptr<FinalNetupTsHealth>& existing) {
+                return !existing || existing->branchIndex == branchIndex;
+            }), branches.end());
+        branches.push_back(health);
+    }
+    std::cerr << "FINAL TS WATCH 203.66: stream=" << state->config.id
+              << " branch=" << branchIndex
+              << " type=" << outputType
+              << " tap=post-netup-reservoir-pre-output-queue"
+              << " fault=null-ratio>=98%-and-no-media"
+              << " action=per-stream-full-rebuild" << std::endl;
 }
 
 TransportScramblingCount countTransportScrambling(const guint8* data, std::size_t size, StreamState* state) {
@@ -9346,6 +9608,13 @@ bool StreamManager::buildRemapPipeline(
     if (!outputLinked) {
         return false;
     }
+    if (netupReservoirPacerActive) {
+        // 203.66: outputQueue is directly downstream from the reservoir. Probe
+        // its sink pad so telemetry describes the exact TS handed to the
+        // network branch, including reservoir-generated NULL fill.
+        attachFinalNetupTsProbe20366(
+            state, outputQueue, cfg, branchIndex, networkType);
+    }
 
     auto context = std::make_unique<RemapContext>();
     context->mux = mux;
@@ -10822,11 +11091,12 @@ void StreamManager::monitorBus(const std::string& id) {
         (configuredInputKind == tvs::stream_protocols::InputProtocolKind::Srt ||
          configuredInputKind == tvs::stream_protocols::InputProtocolKind::Udp ||
          configuredInputKind == tvs::stream_protocols::InputProtocolKind::Rtp)) {
-        std::cerr << "MEDIA WATCH 203.65: stream=" << id
+        std::cerr << "MEDIA WATCH 203.66: stream=" << id
                   << " protocol=" << tvs::stream_protocols::inputKindName(configuredInputKind)
                   << " transport_counter=input-bytes"
                   << " media_counter=pat-pmt-audio-video-pids"
                   << " output_counter=normalized-media-pids"
+                  << " final_netup_counter=post-pacer-pat-pmt-pcr-media-null"
                   << " startup_gate=first-output-media outage_epoch=5s clean_rebuild_on_media_return=on"
                   << " stall_ms="
                   << std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -10855,6 +11125,26 @@ void StreamManager::monitorBus(const std::string& id) {
     // transport. Recovery is edge-triggered: one rebuild when media returns.
     bool mediaOutageEpochActive = false;
     auto mediaOutageEpochStarted = std::chrono::steady_clock::time_point::min();
+    // 203.66: per-final-NETUP-branch sliding samples.  The generation pointer
+    // changes whenever a stream rebuild constructs a fresh reservoir probe, so
+    // startup grace is automatically re-armed even for rebuilds initiated by
+    // another watchdog.
+    struct FinalTsWatchState20366 {
+        const FinalNetupTsHealth* generation = nullptr;
+        uint64_t totalPackets = 0;
+        uint64_t nullPackets = 0;
+        uint64_t mediaPackets = 0;
+        uint64_t patPackets = 0;
+        uint64_t pmtPackets = 0;
+        uint64_t pcrPackets = 0;
+        std::chrono::steady_clock::time_point firstSeen =
+            std::chrono::steady_clock::time_point::min();
+        std::chrono::steady_clock::time_point nullOnlySince =
+            std::chrono::steady_clock::time_point::min();
+        bool upstreamNullOnlyLogged = false;
+    };
+    std::map<std::size_t, FinalTsWatchState20366> finalTsWatch20366;
+    auto lastFinalTsRecovery20366 = std::chrono::steady_clock::time_point::min();
 
     while (state->running.load()) {
         const auto now = std::chrono::steady_clock::now();
@@ -11403,6 +11693,170 @@ void StreamManager::monitorBus(const std::string& id) {
         const auto inputMediaGap = now - state->lastInputMediaActivity;
         const auto outputMediaGap = now - state->lastOutputMediaActivity;
 
+        // 203.66: inspect each strict SRT/HTTP branch after its NETUP reservoir.
+        // If real input media is flowing but the exact final branch is almost
+        // entirely PID 0x1fff for a sustained interval, the branch itself is
+        // stuck and must be rebuilt. Conversely, if the input is itself NULL
+        // only, report DEGRADED but wait for the 203.65 media-return edge rather
+        // than pointlessly rebuilding against the same empty upstream.
+        std::vector<std::shared_ptr<FinalNetupTsHealth>> finalTsBranches20366;
+        {
+            std::lock_guard<std::mutex> lock(state->finalNetupTsHealthMutex);
+            finalTsBranches20366 = state->finalNetupTsHealth;
+        }
+        std::shared_ptr<FinalNetupTsHealth> finalTsFaultBranch20366;
+        double finalTsFaultNullRatio20366 = 0.0;
+        uint64_t finalTsFaultDeltaTotal20366 = 0;
+        uint64_t finalTsFaultDeltaNull20366 = 0;
+        uint64_t finalTsFaultDeltaMedia20366 = 0;
+        uint64_t finalTsFaultDeltaPat20366 = 0;
+        uint64_t finalTsFaultDeltaPmt20366 = 0;
+        uint64_t finalTsFaultDeltaPcr20366 = 0;
+
+        for (const auto& health : finalTsBranches20366) {
+            if (!health) continue;
+            auto& watch = finalTsWatch20366[health->branchIndex];
+            const uint64_t total = health->totalPackets.load(std::memory_order_relaxed);
+            const uint64_t nulls = health->nullPackets.load(std::memory_order_relaxed);
+            const uint64_t media = health->mediaPackets.load(std::memory_order_relaxed);
+            const uint64_t pats = health->patPackets.load(std::memory_order_relaxed);
+            const uint64_t pmts = health->pmtPackets.load(std::memory_order_relaxed);
+            const uint64_t pcrs = health->pcrPackets.load(std::memory_order_relaxed);
+
+            if (watch.generation != health.get() || total < watch.totalPackets ||
+                nulls < watch.nullPackets || media < watch.mediaPackets) {
+                watch = FinalTsWatchState20366{};
+                watch.generation = health.get();
+                watch.firstSeen = now;
+                watch.totalPackets = total;
+                watch.nullPackets = nulls;
+                watch.mediaPackets = media;
+                watch.patPackets = pats;
+                watch.pmtPackets = pmts;
+                watch.pcrPackets = pcrs;
+                continue;
+            }
+
+            const uint64_t deltaTotal = total - watch.totalPackets;
+            const uint64_t deltaNull = nulls - watch.nullPackets;
+            const uint64_t deltaMedia = media - watch.mediaPackets;
+            const uint64_t deltaPat = pats - watch.patPackets;
+            const uint64_t deltaPmt = pmts - watch.pmtPackets;
+            const uint64_t deltaPcr = pcrs - watch.pcrPackets;
+            watch.totalPackets = total;
+            watch.nullPackets = nulls;
+            watch.mediaPackets = media;
+            watch.patPackets = pats;
+            watch.pmtPackets = pmts;
+            watch.pcrPackets = pcrs;
+
+            if (deltaTotal == 0) continue;
+            const double nullRatio = static_cast<double>(deltaNull) /
+                static_cast<double>(deltaTotal);
+            if (deltaMedia > 0 || nullRatio < kFinalTsNullOnlyRatio) {
+                watch.nullOnlySince = std::chrono::steady_clock::time_point::min();
+                watch.upstreamNullOnlyLogged = false;
+                continue;
+            }
+
+            if (watch.nullOnlySince == std::chrono::steady_clock::time_point::min()) {
+                watch.nullOnlySince = now;
+            }
+            const bool startupGraceDone =
+                watch.firstSeen != std::chrono::steady_clock::time_point::min() &&
+                now - watch.firstSeen >= kFinalTsStartupGrace;
+            const bool sustainedNullOnly = startupGraceDone &&
+                now - watch.nullOnlySince >= kFinalTsNullOnlyFaultDelay;
+            if (!sustainedNullOnly) continue;
+
+            if (!inputMediaRecent) {
+                if (!watch.upstreamNullOnlyLogged) {
+                    watch.upstreamNullOnlyLogged = true;
+                    state->statusMessage = "degraded: transport active but media missing";
+                    std::cerr << "FINAL TS WATCH 203.66: stream=" << id
+                              << " branch=" << health->branchIndex
+                              << " type=" << health->outputType
+                              << " state=upstream-media-missing-final-null-only"
+                              << " null_ratio=" << nullRatio
+                              << " delta_packets=" << deltaTotal
+                              << " delta_null=" << deltaNull
+                              << " delta_media=" << deltaMedia
+                              << " delta_pat=" << deltaPat
+                              << " delta_pmt=" << deltaPmt
+                              << " delta_pcr=" << deltaPcr
+                              << " action=mark-degraded-wait-real-media"
+                              << std::endl;
+                }
+                continue;
+            }
+
+            const bool cooldownDone =
+                lastFinalTsRecovery20366 == std::chrono::steady_clock::time_point::min() ||
+                now - lastFinalTsRecovery20366 >= kFinalTsRecoveryCooldown;
+            if (!cooldownDone || finalTsFaultBranch20366) continue;
+            finalTsFaultBranch20366 = health;
+            finalTsFaultNullRatio20366 = nullRatio;
+            finalTsFaultDeltaTotal20366 = deltaTotal;
+            finalTsFaultDeltaNull20366 = deltaNull;
+            finalTsFaultDeltaMedia20366 = deltaMedia;
+            finalTsFaultDeltaPat20366 = deltaPat;
+            finalTsFaultDeltaPmt20366 = deltaPmt;
+            finalTsFaultDeltaPcr20366 = deltaPcr;
+        }
+
+        if (mediaWatchEligible && finalTsFaultBranch20366) {
+            const std::string recoveryUri = state->activeInputUri.empty()
+                ? state->primaryInputUri : state->activeInputUri;
+            const bool recoverBackup = state->usingBackup;
+            std::cerr << "FINAL TS STALL RECOVERY 203.66: stream=" << id
+                      << " branch=" << finalTsFaultBranch20366->branchIndex
+                      << " type=" << finalTsFaultBranch20366->outputType
+                      << " reason=input-media-live-final-output-null-only"
+                      << " null_ratio=" << finalTsFaultNullRatio20366
+                      << " delta_packets=" << finalTsFaultDeltaTotal20366
+                      << " delta_null=" << finalTsFaultDeltaNull20366
+                      << " delta_media=" << finalTsFaultDeltaMedia20366
+                      << " delta_pat=" << finalTsFaultDeltaPat20366
+                      << " delta_pmt=" << finalTsFaultDeltaPmt20366
+                      << " delta_pcr=" << finalTsFaultDeltaPcr20366
+                      << " action=full-pipeline-rebuild-only-this-stream"
+                      << std::endl;
+            lastFinalTsRecovery20366 = now;
+            if (!recoveryUri.empty() && restartActiveInput(state, recoveryUri, recoverBackup)) {
+                bus = state->bus;
+                state->lastInputMediaPacketsSeen =
+                    state->inputTsMediaPackets.load(std::memory_order_relaxed);
+                state->lastOutputMediaPacketsSeen =
+                    state->outputTsPayloadPackets.load(std::memory_order_relaxed);
+                state->lastInputMediaActivity = now;
+                state->lastOutputMediaActivity = now;
+                mediaOutputEstablished = false;
+                mediaOutageEpochActive = false;
+                mediaOutageEpochStarted = std::chrono::steady_clock::time_point::min();
+                mediaReturnOutputGraceUntil = std::chrono::steady_clock::time_point::min();
+                mediaTransportOnlyLogged = false;
+                finalTsWatch20366.clear();
+                state->lastInputActivity = now;
+                state->lastInputBytesSeen =
+                    state->inputBytes.load(std::memory_order_relaxed);
+                networkRecoveryPending = false;
+                networkRecoveryAttempts = 0;
+                networkRecoveryDue = std::chrono::steady_clock::time_point::min();
+                state->statusMessage = "final TS null-only branch rebuilt";
+                state->active = true;
+                std::cerr << "FINAL TS STALL RECOVERY 203.66: stream=" << id
+                          << " result=rebuild-started" << std::endl;
+                continue;
+            }
+            bus = state->bus;
+            state->active = true;
+            std::cerr << "FINAL TS STALL RECOVERY 203.66: stream=" << id
+                      << " result=rebuild-failed cooldown_ms="
+                      << std::chrono::duration_cast<std::chrono::milliseconds>(
+                             kFinalTsRecoveryCooldown).count()
+                      << std::endl;
+        }
+
         // 203.65: NULL/PSI is transport activity, not media health. Once this
         // pipeline has produced real output at least once, a sustained absence
         // of real input media starts a degraded-media epoch even if the socket
@@ -11412,7 +11866,7 @@ void StreamManager::monitorBus(const std::string& id) {
             mediaOutageEpochActive = true;
             mediaOutageEpochStarted = now;
             mediaTransportOnlyLogged = true;
-            std::cerr << "MEDIA WATCH 203.65: stream=" << id
+            std::cerr << "MEDIA WATCH 203.66: stream=" << id
                       << " state=media-degraded"
                       << " transport_recent=" << (transportRecent ? 1 : 0)
                       << " input_media_gap_ms="
@@ -11435,7 +11889,7 @@ void StreamManager::monitorBus(const std::string& id) {
             const bool recoverBackup = state->usingBackup;
             const auto outageMs = std::chrono::duration_cast<std::chrono::milliseconds>(
                 now - mediaOutageEpochStarted).count();
-            std::cerr << "MEDIA WATCH 203.65: stream=" << id
+            std::cerr << "MEDIA WATCH 203.66: stream=" << id
                       << " state=media-returned-after-outage"
                       << " outage_ms=" << outageMs
                       << " input_media_packets=" << currentInputMediaPackets
@@ -11462,14 +11916,14 @@ void StreamManager::monitorBus(const std::string& id) {
                 networkRecoveryDue = std::chrono::steady_clock::time_point::min();
                 state->statusMessage = "media returned; clean pipeline epoch started";
                 state->active = true;
-                std::cerr << "MEDIA STALL RECOVERY 203.65: stream=" << id
+                std::cerr << "MEDIA STALL RECOVERY 203.66: stream=" << id
                           << " reason=media-return-after-null-or-no-media"
                           << " result=rebuild-started" << std::endl;
                 continue;
             }
             bus = state->bus;
             state->active = true;
-            std::cerr << "MEDIA STALL RECOVERY 203.65: stream=" << id
+            std::cerr << "MEDIA STALL RECOVERY 203.66: stream=" << id
                       << " reason=media-return-after-null-or-no-media"
                       << " result=rebuild-failed cooldown_ms="
                       << std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -11488,7 +11942,7 @@ void StreamManager::monitorBus(const std::string& id) {
             const std::string recoveryUri = state->activeInputUri.empty()
                 ? state->primaryInputUri : state->activeInputUri;
             const bool recoverBackup = state->usingBackup;
-            std::cerr << "MEDIA STALL RECOVERY 203.65: stream=" << id
+            std::cerr << "MEDIA STALL RECOVERY 203.66: stream=" << id
                       << " protocol=" << tvs::stream_protocols::inputKindName(activeInputKind)
                       << " reason=input-media-progress-output-media-stalled"
                       << " input_media_packets=" << currentInputMediaPackets
@@ -11518,13 +11972,13 @@ void StreamManager::monitorBus(const std::string& id) {
                 networkRecoveryDue = std::chrono::steady_clock::time_point::min();
                 state->statusMessage = "media pipeline recovered";
                 state->active = true;
-                std::cerr << "MEDIA STALL RECOVERY 203.65: stream=" << id
+                std::cerr << "MEDIA STALL RECOVERY 203.66: stream=" << id
                           << " result=rebuild-started" << std::endl;
                 continue;
             }
             bus = state->bus;
             state->active = true;
-            std::cerr << "MEDIA STALL RECOVERY 203.65: stream=" << id
+            std::cerr << "MEDIA STALL RECOVERY 203.66: stream=" << id
                       << " result=rebuild-failed cooldown_ms="
                       << std::chrono::duration_cast<std::chrono::milliseconds>(
                              kMediaPipelineRecoveryCooldown).count()

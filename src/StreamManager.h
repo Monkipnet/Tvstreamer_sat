@@ -101,6 +101,27 @@ struct DvbServiceRelayState {
     std::shared_ptr<void> dispatcherConsumer;
 };
 
+// 203.66: per-NETUP-branch telemetry is collected after the monotonic
+// reservoir pacer, immediately before the network output queue.  The older
+// common output probe can sit before per-output remux/pacer branches when a
+// stream has multiple outputs, so it cannot prove what bytes actually leave a
+// particular SRT/HTTP branch.
+struct FinalNetupTsHealth {
+    std::size_t branchIndex = 0;
+    std::string outputType;
+    std::atomic<uint64_t> totalPackets{0};
+    std::atomic<uint64_t> nullPackets{0};
+    std::atomic<uint64_t> mediaPackets{0};
+    std::atomic<uint64_t> patPackets{0};
+    std::atomic<uint64_t> pmtPackets{0};
+    std::atomic<uint64_t> pcrPackets{0};
+    std::atomic<uint64_t> lastPacketNs{0};
+    std::atomic<uint64_t> lastMediaNs{0};
+    std::atomic<uint64_t> lastPatNs{0};
+    std::atomic<uint64_t> lastPmtNs{0};
+    std::atomic<uint64_t> lastPcrNs{0};
+};
+
 struct StreamState {
     std::atomic<bool> active{false};
     std::atomic<bool> running{false};
@@ -234,6 +255,11 @@ struct StreamState {
     uint64_t lastOutputMediaPacketsSeen = 0;
     std::chrono::steady_clock::time_point lastInputMediaActivity = std::chrono::steady_clock::now();
     std::chrono::steady_clock::time_point lastOutputMediaActivity = std::chrono::steady_clock::now();
+    // 203.66: one health object per strict NETUP SRT/HTTP branch.  A shared_ptr
+    // lets an old pipeline probe finish safely after a rebuild while the state
+    // immediately publishes only the new generation's branch objects.
+    std::mutex finalNetupTsHealthMutex;
+    std::vector<std::shared_ptr<FinalNetupTsHealth>> finalNetupTsHealth;
     std::array<uint8_t, 8192> outputContinuity {};
     std::array<bool, 8192> outputContinuityValid {};
     std::vector<uint8_t> outputTsRemainder;
