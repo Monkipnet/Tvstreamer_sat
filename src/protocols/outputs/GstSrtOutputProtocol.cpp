@@ -1,6 +1,9 @@
 #include "protocols/outputs/GstSrtOutputProtocol.h"
 #include "protocols/outputs/GstOutputProtocolUtils.h"
 #include "protocols/GstProtocolTypes.h"
+#include "protocols/SrtVpsProfile.h"
+
+#include <iostream>
 
 namespace tvs::protocols::outputs {
 
@@ -46,20 +49,23 @@ bool appendSrtSink(std::vector<std::string>& args, const StreamConfig& cfg, GstO
         return true;
     }
 
-    const std::string uri = "srt://" + safeHost(cfg.outputHost, "127.0.0.1") + ":" +
-                            std::to_string(port) + "?mode=caller";
+    const std::string uri = tvs::protocols::srt_vps::applyToUri(
+        "srt://" + safeHost(cfg.outputHost, "127.0.0.1") + ":" +
+            std::to_string(port) + "?mode=caller", cfg);
+    const int srtLatencyMs = tvs::protocols::srt_vps::latencyMs(cfg, 700);
+    const int srtPollTimeoutMs = tvs::protocols::srt_vps::pollTimeoutMs(cfg, 5000);
 
     args.insert(args.end(), {
         "srtsink",
         "uri=" + uri,
-        "latency=700",
+        "latency=" + std::to_string(srtLatencyMs),
         "sync=false",
         "async=false",
         "qos=false",
         "max-lateness=-1",
         "blocksize=1316",
         "wait-for-connection=false",
-        "poll-timeout=5000"
+        "poll-timeout=" + std::to_string(srtPollTimeoutMs)
     });
 
     if (!cfg.interfaceAddress.empty() && cfg.interfaceAddress != "0.0.0.0" && cfg.interfaceAddress != "::") {
@@ -67,6 +73,17 @@ bool appendSrtSink(std::vector<std::string>& args, const StreamConfig& cfg, GstO
     }
     args.push_back("localport=0");
 
+    if (cfg.srtVpsVdsOptimization) {
+        std::cerr << "SRT VPS/VDS PROFILE 203.67: stream=" << cfg.id
+                  << " direction=transcoded-output enabled=on"
+                  << " latency_ms=" << srtLatencyMs
+                  << " poll_timeout_ms=" << srtPollTimeoutMs
+                  << " srt_rcvbuf=" << tvs::protocols::srt_vps::kSrtReceiveBufferBytes
+                  << " srt_sndbuf=" << tvs::protocols::srt_vps::kSrtSendBufferBytes
+                  << " fc_packets=" << tvs::protocols::srt_vps::kFlightWindowPackets
+                  << " payload_size=" << tvs::protocols::srt_vps::kPayloadSizeBytes
+                  << std::endl;
+    }
     assignTsPads(cfg, spec);
     spec.description = "srt-caller@" + uri;
     return true;

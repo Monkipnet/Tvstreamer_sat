@@ -521,8 +521,20 @@ std::map<std::string, StreamConfig> streamConfigById(const std::vector<StreamCon
     return result;
 }
 
+bool streamUsesSrt(const StreamConfig& cfg) {
+    if (toLower(cfg.inputUri).rfind("srt://", 0) == 0 || toLower(cfg.outputType) == "srt") {
+        return true;
+    }
+    for (const auto& output : cfg.additionalOutputs) {
+        if (toLower(output.outputType) == "srt") return true;
+    }
+    return false;
+}
+
 bool sameStreamConfig(const StreamConfig& left, const StreamConfig& right) {
-    return left.toJson() == right.toJson();
+    if (left.toJson() != right.toJson()) return false;
+    if (!streamUsesSrt(left) && !streamUsesSrt(right)) return true;
+    return left.srtVpsVdsOptimization == right.srtVpsVdsOptimization;
 }
 
 std::string streamLink(const StreamConfig& cfg, int httpPort) {
@@ -1535,6 +1547,7 @@ std::string HttpServer::currentState() {
     root["language"] = configManager.config.language;
     root["telegram_token"] = configManager.config.telegramToken;
     root["telegram_chat_id"] = configManager.config.telegramChatId;
+    root["srt_vps_vds_optimization"] = configManager.config.srtVpsVdsOptimization;
     Json::Value camClients(Json::arrayValue);
     for (const auto& client : configManager.config.camClients) camClients.append(client.toJson());
     root["cam_clients"] = camClients;
@@ -2560,6 +2573,9 @@ std::string HttpServer::handleSaveConfig(const std::string& body) {
     if (!root.isMember("language")) {
         nextConfig.language = configManager.config.language;
     }
+    if (!root.isMember("srt_vps_vds_optimization")) {
+        nextConfig.srtVpsVdsOptimization = configManager.config.srtVpsVdsOptimization;
+    }
     if (!root.isMember("cam_clients")) {
         nextConfig.camClients = configManager.config.camClients;
     }
@@ -2588,6 +2604,13 @@ std::string HttpServer::handleSaveConfig(const std::string& body) {
             [](const MptsOutputConfig& output) { return output.services.empty(); }),
             nextConfig.mptsOutputs.end());
     }
+    // 203.67: the VPS/VDS SRT profile is a server-wide switch. Propagate the
+    // runtime flag into every stream before comparison so active SRT pipelines
+    // are hard-restarted and recreate their sockets when the switch changes.
+    for (auto& stream : nextConfig.streams) {
+        stream.srtVpsVdsOptimization = nextConfig.srtVpsVdsOptimization;
+    }
+
     std::string listenerError;
     if (!validateHttpPortsForConfig(nextConfig, listenerError)) {
         std::cerr << "Config save rejected: " << listenerError << std::endl;
@@ -4662,6 +4685,7 @@ function openLoginModal() {
       <div class="form-row"><label>Новый пароль</label><input id="password" type="password" placeholder="Оставьте пустым, чтобы не менять" /></div>
       <div class="form-row"><label>Имя сервера</label><input id="serverName" value="${state.server_name||''}" /></div>
       <div class="form-row"><label>Порт web-интерфейса</label><input id="httpPort" type="number" min="1" max="65535" value="${state.http_port||9000}" /></div>
+      <div class="form-row full"><label>SRT для VPS/VDS</label><div class="checkbox-inline"><input id="srtVpsVdsOptimization" type="checkbox" ${state.srt_vps_vds_optimization ? 'checked' : ''} /><span>Оптимизация SRT для VPS/VDS/контейнеров</span></div><small>203.67: включает для всех SRT-входов и выходов latency 1500 ms, rcvlatency/peerlatency 1500 ms, SRT RX/TX buffers 16 MiB, FC 32768 пакетов и poll-timeout 2000 ms. Использовать на VPS/VDS с виртуальной сетью; на обычном LAN/физическом сервере оставлять выключенным.</small></div>
     </div>
     <div class="modal-actions">
       <button class="button-secondary" onclick="closeModal()">${t('cancel')}</button>
@@ -5696,6 +5720,9 @@ function saveSettings() {
     telegram_chat_id: document.getElementById('telegramChatId')?.value || state.telegram_chat_id,
     http_port: httpPort,
     language,
+    srt_vps_vds_optimization: document.getElementById('srtVpsVdsOptimization')
+      ? document.getElementById('srtVpsVdsOptimization').checked
+      : Boolean(state.srt_vps_vds_optimization),
     streams: state.streams
   };
   const password = document.getElementById('password')?.value;

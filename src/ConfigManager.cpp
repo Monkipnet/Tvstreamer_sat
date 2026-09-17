@@ -528,6 +528,7 @@ Json::Value AppConfig::toJson() const {
     root["language"] = language;
     root["telegram_token"] = telegramToken;
     root["telegram_chat_id"] = telegramChatId;
+    root["srt_vps_vds_optimization"] = srtVpsVdsOptimization;
     Json::Value camClientsJson(Json::arrayValue);
     for (const auto& client : camClients) camClientsJson.append(client.toJson());
     root["cam_clients"] = camClientsJson;
@@ -554,12 +555,15 @@ AppConfig AppConfig::fromJson(const Json::Value& root) {
     }
     config.telegramToken = root.get("telegram_token", "").asString();
     config.telegramChatId = root.get("telegram_chat_id", "").asString();
+    config.srtVpsVdsOptimization = root.get("srt_vps_vds_optimization", false).asBool();
     if (root.isMember("cam_clients") && root["cam_clients"].isArray()) {
         for (const auto& item : root["cam_clients"]) config.camClients.push_back(CamClientConfig::fromJson(item));
     }
     if (root.isMember("streams") && root["streams"].isArray()) {
         for (const auto& item : root["streams"]) {
-            config.streams.push_back(StreamConfig::fromJson(item));
+            auto stream = StreamConfig::fromJson(item);
+            stream.srtVpsVdsOptimization = config.srtVpsVdsOptimization;
+            config.streams.push_back(std::move(stream));
         }
     }
     if (root.isMember("mpts_outputs") && root["mpts_outputs"].isArray()) {

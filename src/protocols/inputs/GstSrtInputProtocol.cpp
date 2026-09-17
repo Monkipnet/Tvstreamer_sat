@@ -1,4 +1,5 @@
 #include "protocols/inputs/GstSrtInputProtocol.h"
+#include "protocols/SrtVpsProfile.h"
 #include "utils.h"
 namespace tvs::protocols::inputs {
 bool isSrtInput(const StreamConfig& cfg) {
@@ -11,6 +12,6 @@ std::string srtInputUri(const StreamConfig& cfg) {
         uri += (uri.find('?') == std::string::npos ? "?" : "&");
         uri += "mode=" + mode;
     }
-    return uri;
+    return tvs::protocols::srt_vps::applyToUri(uri, cfg);
 }
 }

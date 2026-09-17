@@ -95,6 +95,8 @@ struct StreamConfig {
     std::string serviceProvider;
     std::string conditionalAccessClient;
     std::vector<StreamOutputConfig> additionalOutputs;
+    // 203.67 runtime-inherited global mode; not serialized per stream.
+    bool srtVpsVdsOptimization = false;
 
     Json::Value toJson() const;
     static StreamConfig fromJson(const Json::Value& root);
@@ -120,6 +122,8 @@ struct AppConfig {
     std::string language = "en";
     std::string telegramToken;
     std::string telegramChatId;
+    // Opt-in SRT profile for VPS/VDS/container hosts.
+    bool srtVpsVdsOptimization = false;
     std::vector<StreamConfig> streams;
     std::vector<MptsOutputConfig> mptsOutputs;
     std::vector<CamClientConfig> camClients;

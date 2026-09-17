@@ -13,6 +13,7 @@
 #include "protocols/GstProtocolTypes.h"
 #include "protocols/stream/StreamInputProtocol.h"
 #include "protocols/stream/StreamOutputProtocol.h"
+#include "protocols/SrtVpsProfile.h"
 
 #include <algorithm>
 #include <array>
@@ -4625,8 +4626,9 @@ void configureSrtSink(GstElement* sink, const StreamConfig& cfg, bool accessFilt
         : cfg.outputHost;
     const std::string bindHost = cfg.interfaceAddress.empty() ? "0.0.0.0" : cfg.interfaceAddress;
     const int effectivePort = (cfg.outputPort > 0 && cfg.outputPort <= 65535) ? cfg.outputPort : 7001;
-    const std::string uri = "srt://" + (caller ? targetHost : bindHost) + ":" +
-        std::to_string(effectivePort) + "?mode=" + mode;
+    const std::string uri = tvs::protocols::srt_vps::applyToUri(
+        "srt://" + (caller ? targetHost : bindHost) + ":" +
+            std::to_string(effectivePort) + "?mode=" + mode, cfg);
 
     g_object_set(sink,
         "uri", uri.c_str(),
@@ -4646,9 +4648,12 @@ void configureSrtSink(GstElement* sink, const StreamConfig& cfg, bool accessFilt
     // 203.48: bound libsrt poll waits so caller disconnects cannot leave a
     // listener branch stuck in an infinite control-path wait during teardown
     // or branch recovery. keep-listening remains enabled for listener mode.
-    setIntPropertyIfPresent(sink, "poll-timeout", 1000);
+    const int normalPollTimeoutMs = 1000;
+    const int effectivePollTimeoutMs = tvs::protocols::srt_vps::pollTimeoutMs(cfg, normalPollTimeoutMs);
+    setIntPropertyIfPresent(sink, "poll-timeout", effectivePollTimeoutMs);
     setBooleanPropertyIfPresent(sink, "qos", FALSE);
-    const int srtLatency = transcoded ? kSrtTranscodedOutputLatencyMs : kSrtOutputLatencyMs;
+    const int normalSrtLatency = transcoded ? kSrtTranscodedOutputLatencyMs : kSrtOutputLatencyMs;
+    const int srtLatency = tvs::protocols::srt_vps::latencyMs(cfg, normalSrtLatency);
     setIntPropertyIfPresent(sink, "latency", srtLatency);
     setInt64PropertyIfPresent(sink, "max-lateness", -1);
     setStringPropertyIfPresent(sink, "localaddress", cfg.interfaceAddress);
@@ -4668,10 +4673,24 @@ void configureSrtSink(GstElement* sink, const StreamConfig& cfg, bool accessFilt
               << " auth=" << (accessFilteringEnabled ? "on" : "off")
               << " transcode=" << (transcoded ? "yes" : "no")
               << " latency-ms=" << srtLatency
-              << " poll-timeout-ms=1000"
+              << " poll-timeout-ms=" << effectivePollTimeoutMs
               << " listener-keepalive=" << (!caller ? "on" : "n/a")
               << " transport_cbr=" << (cbrMuxEnabled(cfg) ? std::to_string(cfg.targetBitrate) : "off")
               << std::endl;
+    if (cfg.srtVpsVdsOptimization) {
+        std::cerr << "SRT VPS/VDS PROFILE 203.67: stream=" << cfg.id
+                  << " direction=output enabled=on mode=" << mode
+                  << " latency_ms=" << srtLatency
+                  << " rcvlatency_ms=" << tvs::protocols::srt_vps::kLatencyMs
+                  << " peerlatency_ms=" << tvs::protocols::srt_vps::kLatencyMs
+                  << " poll_timeout_ms=" << effectivePollTimeoutMs
+                  << " srt_rcvbuf=" << tvs::protocols::srt_vps::kSrtReceiveBufferBytes
+                  << " srt_sndbuf=" << tvs::protocols::srt_vps::kSrtSendBufferBytes
+                  << " fc_packets=" << tvs::protocols::srt_vps::kFlightWindowPackets
+                  << " payload_size=" << tvs::protocols::srt_vps::kPayloadSizeBytes
+                  << " note=kernel-udp-buffer-remains-host-controlled"
+                  << std::endl;
+    }
 }
 
 std::string rtmpOutputLocation(const StreamConfig& cfg) {
@@ -11066,12 +11085,17 @@ void StreamManager::monitorBus(const std::string& id) {
 
     const auto configuredInputKind = tvs::stream_protocols::inputKind(state->config);
     if (configuredInputKind == tvs::stream_protocols::InputProtocolKind::Srt) {
-        std::cerr << "SRT input watchdog 203.48: startup_wait_ms=15000"
+        const int watchdogLatencyMs = tvs::protocols::srt_vps::latencyMs(state->config, 500);
+        const int watchdogPollTimeoutMs = tvs::protocols::srt_vps::pollTimeoutMs(state->config, 1000);
+        std::cerr << "SRT input watchdog 203.67: startup_wait_ms=15000"
                   << " fast_reconnect_ms=4000 reconnect_grace_ms=4000"
                   << " full_rebuild_ms=8000 primary_probe_ms=15000"
-                  << " source_poll_timeout_ms=1000 app_reconnect=two-stage"
+                  << " source_poll_timeout_ms=" << watchdogPollTimeoutMs
+                  << " app_reconnect=two-stage"
                   << " source_only_restart=enabled-srt-only"
-                  << " latency_ms=500 queue_ms=6000 queue_max_mb=64" << std::endl;
+                  << " latency_ms=" << watchdogLatencyMs
+                  << " vps_vds_profile=" << (state->config.srtVpsVdsOptimization ? "on" : "off")
+                  << " queue_ms=6000 queue_max_mb=64" << std::endl;
     } else if (configuredInputKind == tvs::stream_protocols::InputProtocolKind::Http) {
         std::cerr << "HTTP MPEG-TS watchdog 202.57: loss_detect_ms=30000 rebuild_ms=30000"
                   << " source_retries=gstreamer-default error_recovery=on eos_recovery=on"

@@ -6,6 +6,7 @@
 #include "protocols/inputs/GstHttpInputProtocol.h"
 #include "protocols/inputs/GstSrtInputProtocol.h"
 #include "protocols/stream/StreamInputProtocol.h"
+#include "protocols/SrtVpsProfile.h"
 #include "utils.h"
 
 #include <algorithm>
@@ -246,12 +247,14 @@ GstElement* buildSrt(
     setBooleanPropertyIfPresent(src, "do-timestamp", TRUE);
     const bool hasAutoReconnect = hasProperty(src, "auto-reconnect");
     setBooleanPropertyIfPresent(src, "auto-reconnect", TRUE);
-    setIntPropertyIfPresent(src, "latency", kSrtLatencyMs);
+    const gint effectiveLatencyMs = tvs::protocols::srt_vps::latencyMs(cfg, kSrtLatencyMs);
+    const gint effectivePollTimeoutMs = tvs::protocols::srt_vps::pollTimeoutMs(cfg, kSrtPollTimeoutMs);
+    setIntPropertyIfPresent(src, "latency", effectiveLatencyMs);
     // 202.63: older GStreamer SRT sources default poll-timeout to -1. A source
     // stuck in an infinite libsrt poll can then block gst_element_set_state(NULL)
     // and prevent the application recovery deadline from ever running. Keep the
     // media latency at 500 ms, but bound the control-path poll to one second.
-    setIntPropertyIfPresent(src, "poll-timeout", kSrtPollTimeoutMs);
+    setIntPropertyIfPresent(src, "poll-timeout", effectivePollTimeoutMs);
     setStringPropertyIfPresent(src, "localaddress", configuredInputInterfaceAddress(cfg));
 
     if (mode == "listener") {
@@ -272,12 +275,26 @@ GstElement* buildSrt(
     terminalElement = queue;
     std::cerr << "Network TS input 202.72: protocol=SRT mode=" << mode
               << " factory=" << factory
-              << " latency_ms=" << kSrtLatencyMs
-              << " poll_timeout_ms=" << kSrtPollTimeoutMs
+              << " latency_ms=" << effectiveLatencyMs
+              << " poll_timeout_ms=" << effectivePollTimeoutMs
               << " auto_reconnect_property=" << (hasAutoReconnect ? "yes" : "no")
               << " app_reconnect=203.48-source-only-first+full-fallback"
               << " queue_ms=6000 queue_max_mb=64 leaky=off prebuffer=off"
               << " do_timestamp=on input_pacing=off" << std::endl;
+    if (cfg.srtVpsVdsOptimization) {
+        std::cerr << "SRT VPS/VDS PROFILE 203.67: stream=" << cfg.id
+                  << " direction=input enabled=on"
+                  << " latency_ms=" << tvs::protocols::srt_vps::kLatencyMs
+                  << " rcvlatency_ms=" << tvs::protocols::srt_vps::kLatencyMs
+                  << " peerlatency_ms=" << tvs::protocols::srt_vps::kLatencyMs
+                  << " poll_timeout_ms=" << tvs::protocols::srt_vps::kPollTimeoutMs
+                  << " srt_rcvbuf=" << tvs::protocols::srt_vps::kSrtReceiveBufferBytes
+                  << " srt_sndbuf=" << tvs::protocols::srt_vps::kSrtSendBufferBytes
+                  << " fc_packets=" << tvs::protocols::srt_vps::kFlightWindowPackets
+                  << " payload_size=" << tvs::protocols::srt_vps::kPayloadSizeBytes
+                  << " note=kernel-udp-buffer-remains-host-controlled"
+                  << std::endl;
+    }
     return src;
 }
 
