@@ -283,7 +283,7 @@ private:
                     (gapNow - underflowStartedNanoseconds) / 1000000ULL;
                 if (!underflowLogged && gapMilliseconds >= kUnderflowLogThresholdMilliseconds) {
                     underflowLogged = true;
-                    std::cerr << "NETUP output reservoir 203.62: stream=" << streamId
+                    std::cerr << "NETUP output reservoir 203.65: stream=" << streamId
                               << " type=" << outputType
                               << " event=underflow-null-fill"
                               << " gap_ms=" << gapMilliseconds
@@ -296,12 +296,12 @@ private:
                 const uint64_t gapMilliseconds =
                     (recoveredAt - underflowStartedNanoseconds) / 1000000ULL;
                 if (underflowLogged) {
-                    std::cerr << "NETUP output reservoir 203.62: stream=" << streamId
+                    std::cerr << "NETUP output reservoir 203.65: stream=" << streamId
                               << " type=" << outputType
                               << " event=underflow-recovered"
                               << " gap_ms=" << gapMilliseconds
                               << " null_chunks=" << (underflowChunks - underflowStartChunk)
-                              << " action=resume-upstream-ts"
+                              << " action=resume-upstream-ts-await-clean-epoch-watchdog"
                               << std::endl;
                 }
                 underflowStartedNanoseconds = 0;

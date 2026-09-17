@@ -108,6 +108,12 @@ constexpr auto kNetworkNoInputRebuildDelay = std::chrono::seconds(12);
 // the normalized/remapped output media has made no progress for this interval.
 constexpr auto kMediaPipelineStallDelay = std::chrono::seconds(5);
 constexpr auto kMediaPipelineRecoveryCooldown = std::chrono::seconds(15);
+// 203.65: once a previously healthy stream has carried no real audio/video
+// media for this long, mark a media-outage epoch. NULL/PSI transport may keep
+// sockets and CBR alive, but it must not be treated as healthy television.
+// When real media returns, rebuild this stream exactly once to discard stale
+// demux/remap/reservoir state and start a clean TS epoch.
+constexpr auto kMediaOutageEpochDelay = std::chrono::seconds(5);
 // 203.64: after a long media gap, allow the remap/demux branch a short chance
 // to resume output before declaring the already-established output stalled.
 constexpr auto kMediaReturnOutputGrace = std::chrono::seconds(2);
@@ -10816,12 +10822,12 @@ void StreamManager::monitorBus(const std::string& id) {
         (configuredInputKind == tvs::stream_protocols::InputProtocolKind::Srt ||
          configuredInputKind == tvs::stream_protocols::InputProtocolKind::Udp ||
          configuredInputKind == tvs::stream_protocols::InputProtocolKind::Rtp)) {
-        std::cerr << "MEDIA WATCH 203.64: stream=" << id
+        std::cerr << "MEDIA WATCH 203.65: stream=" << id
                   << " protocol=" << tvs::stream_protocols::inputKindName(configuredInputKind)
                   << " transport_counter=input-bytes"
                   << " media_counter=pat-pmt-audio-video-pids"
                   << " output_counter=normalized-media-pids"
-                  << " startup_gate=first-output-media"
+                  << " startup_gate=first-output-media outage_epoch=5s clean_rebuild_on_media_return=on"
                   << " stall_ms="
                   << std::chrono::duration_cast<std::chrono::milliseconds>(
                          kMediaPipelineStallDelay).count()
@@ -10845,6 +10851,10 @@ void StreamManager::monitorBus(const std::string& id) {
     bool mediaOutputEstablished = false;
     auto mediaReturnOutputGraceUntil = std::chrono::steady_clock::time_point::min();
     auto lastMediaPipelineRecovery = std::chrono::steady_clock::time_point::min();
+    // 203.65: remember a real-media outage across a still-live NULL/PSI CBR
+    // transport. Recovery is edge-triggered: one rebuild when media returns.
+    bool mediaOutageEpochActive = false;
+    auto mediaOutageEpochStarted = std::chrono::steady_clock::time_point::min();
 
     while (state->running.load()) {
         const auto now = std::chrono::steady_clock::now();
@@ -11393,29 +11403,77 @@ void StreamManager::monitorBus(const std::string& id) {
         const auto inputMediaGap = now - state->lastInputMediaActivity;
         const auto outputMediaGap = now - state->lastOutputMediaActivity;
 
-        if (mediaWatchEligible && transportRecent &&
-            inputMediaGap >= kMediaPipelineStallDelay && !mediaTransportOnlyLogged) {
+        // 203.65: NULL/PSI is transport activity, not media health. Once this
+        // pipeline has produced real output at least once, a sustained absence
+        // of real input media starts a degraded-media epoch even if the socket
+        // itself goes quiet (UDP outage) or keeps receiving NULL CBR (SRT).
+        if (mediaWatchEligible && mediaOutputEstablished && !inputMediaRecent &&
+            inputMediaGap >= kMediaOutageEpochDelay && !mediaOutageEpochActive) {
+            mediaOutageEpochActive = true;
+            mediaOutageEpochStarted = now;
             mediaTransportOnlyLogged = true;
-            std::cerr << "MEDIA WATCH 203.64: stream=" << id
-                      << " state=transport-alive-media-missing"
+            std::cerr << "MEDIA WATCH 203.65: stream=" << id
+                      << " state=media-degraded"
+                      << " transport_recent=" << (transportRecent ? 1 : 0)
                       << " input_media_gap_ms="
                       << std::chrono::duration_cast<std::chrono::milliseconds>(inputMediaGap).count()
                       << " null_packets="
                       << state->inputTsNullPackets.load(std::memory_order_relaxed)
-                      << " action=hold-transport-no-rebuild" << std::endl;
+                      << " action=arm-clean-rebuild-on-media-return" << std::endl;
         }
-        if (mediaTransportOnlyLogged && inputMediaRecent) {
+
+        // The critical 203.65 transition: if useful media returns after a real
+        // outage, do not continue the old demux/remap/reservoir epoch. The old
+        // epoch may be permanently stuck in NULL-fill even though the input has
+        // recovered. Rebuild only this stream once; startup/keyframe/PSI gates
+        // on the fresh pipeline establish the new epoch.
+        if (mediaWatchEligible && mediaOutageEpochActive && inputMediaRecent &&
+            (lastMediaPipelineRecovery == std::chrono::steady_clock::time_point::min() ||
+             now - lastMediaPipelineRecovery >= kMediaPipelineRecoveryCooldown)) {
+            const std::string recoveryUri = state->activeInputUri.empty()
+                ? state->primaryInputUri : state->activeInputUri;
+            const bool recoverBackup = state->usingBackup;
+            const auto outageMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                now - mediaOutageEpochStarted).count();
+            std::cerr << "MEDIA WATCH 203.65: stream=" << id
+                      << " state=media-returned-after-outage"
+                      << " outage_ms=" << outageMs
+                      << " input_media_packets=" << currentInputMediaPackets
+                      << " output_media_packets=" << currentOutputMediaPackets
+                      << " action=full-pipeline-rebuild-clean-epoch" << std::endl;
+            lastMediaPipelineRecovery = now;
+            mediaOutageEpochActive = false;
             mediaTransportOnlyLogged = false;
-            mediaReturnOutputGraceUntil = now + kMediaReturnOutputGrace;
-            std::cerr << "MEDIA WATCH 203.64: stream=" << id
-                      << " state=media-returned"
-                      << " output_media_gap_ms="
-                      << std::chrono::duration_cast<std::chrono::milliseconds>(outputMediaGap).count()
-                      << " output_established=" << (mediaOutputEstablished ? 1 : 0)
-                      << " action=verify-remap-progress"
-                      << " grace_ms="
+            mediaReturnOutputGraceUntil = std::chrono::steady_clock::time_point::min();
+            if (!recoveryUri.empty() && restartActiveInput(state, recoveryUri, recoverBackup)) {
+                bus = state->bus;
+                state->lastInputMediaPacketsSeen =
+                    state->inputTsMediaPackets.load(std::memory_order_relaxed);
+                state->lastOutputMediaPacketsSeen =
+                    state->outputTsPayloadPackets.load(std::memory_order_relaxed);
+                state->lastInputMediaActivity = now;
+                state->lastOutputMediaActivity = now;
+                mediaOutputEstablished = false;
+                state->lastInputActivity = now;
+                state->lastInputBytesSeen =
+                    state->inputBytes.load(std::memory_order_relaxed);
+                networkRecoveryPending = false;
+                networkRecoveryAttempts = 0;
+                networkRecoveryDue = std::chrono::steady_clock::time_point::min();
+                state->statusMessage = "media returned; clean pipeline epoch started";
+                state->active = true;
+                std::cerr << "MEDIA STALL RECOVERY 203.65: stream=" << id
+                          << " reason=media-return-after-null-or-no-media"
+                          << " result=rebuild-started" << std::endl;
+                continue;
+            }
+            bus = state->bus;
+            state->active = true;
+            std::cerr << "MEDIA STALL RECOVERY 203.65: stream=" << id
+                      << " reason=media-return-after-null-or-no-media"
+                      << " result=rebuild-failed cooldown_ms="
                       << std::chrono::duration_cast<std::chrono::milliseconds>(
-                             kMediaReturnOutputGrace).count()
+                             kMediaPipelineRecoveryCooldown).count()
                       << std::endl;
         }
 
@@ -11430,7 +11488,7 @@ void StreamManager::monitorBus(const std::string& id) {
             const std::string recoveryUri = state->activeInputUri.empty()
                 ? state->primaryInputUri : state->activeInputUri;
             const bool recoverBackup = state->usingBackup;
-            std::cerr << "MEDIA STALL RECOVERY 203.64: stream=" << id
+            std::cerr << "MEDIA STALL RECOVERY 203.65: stream=" << id
                       << " protocol=" << tvs::stream_protocols::inputKindName(activeInputKind)
                       << " reason=input-media-progress-output-media-stalled"
                       << " input_media_packets=" << currentInputMediaPackets
@@ -11449,6 +11507,8 @@ void StreamManager::monitorBus(const std::string& id) {
                 state->lastOutputMediaActivity = now;
                 mediaOutputEstablished = false;
                 mediaReturnOutputGraceUntil = std::chrono::steady_clock::time_point::min();
+                mediaOutageEpochActive = false;
+                mediaOutageEpochStarted = std::chrono::steady_clock::time_point::min();
                 state->lastInputActivity = now;
                 state->lastInputBytesSeen =
                     state->inputBytes.load(std::memory_order_relaxed);
@@ -11458,13 +11518,13 @@ void StreamManager::monitorBus(const std::string& id) {
                 networkRecoveryDue = std::chrono::steady_clock::time_point::min();
                 state->statusMessage = "media pipeline recovered";
                 state->active = true;
-                std::cerr << "MEDIA STALL RECOVERY 203.64: stream=" << id
+                std::cerr << "MEDIA STALL RECOVERY 203.65: stream=" << id
                           << " result=rebuild-started" << std::endl;
                 continue;
             }
             bus = state->bus;
             state->active = true;
-            std::cerr << "MEDIA STALL RECOVERY 203.64: stream=" << id
+            std::cerr << "MEDIA STALL RECOVERY 203.65: stream=" << id
                       << " result=rebuild-failed cooldown_ms="
                       << std::chrono::duration_cast<std::chrono::milliseconds>(
                              kMediaPipelineRecoveryCooldown).count()
