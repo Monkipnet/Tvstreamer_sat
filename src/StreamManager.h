@@ -133,6 +133,11 @@ struct StreamState {
     std::string primaryInputUri;
     std::string activeInputUri;
     GstElement* pipeline = nullptr;
+    // An idle private HTTP preview must not feed another full remux chain.
+    // A shared counter also survives an HTTP relay thread finishing after a
+    // stopped stream has been removed from StreamManager::streams.
+    std::shared_ptr<std::atomic<uint32_t>> privatePreviewDemand =
+        std::make_shared<std::atomic<uint32_t>>(0);
     GstBus* bus = nullptr;
     std::thread busThread;
     StreamConfig config;

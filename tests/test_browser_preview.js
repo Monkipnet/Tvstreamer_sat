@@ -1,8 +1,8 @@
 /* Temporary HTTP preview contract: run with node tests/test_browser_preview.js. */
 'use strict';
-const assert = require('node:assert/strict');
-const fs = require('node:fs');
-const path = require('node:path');
+const assert = require('assert').strict || require('assert');
+const fs = require('fs');
+const path = require('path');
 const js = fs.readFileSync(path.join(__dirname, '../web/preview/preview-player.js'), 'utf8');
 const cpp = fs.readFileSync(path.join(__dirname, '../src/HttpServer.cpp'), 'utf8');
 const streamManager = fs.readFileSync(path.join(__dirname, '../src/StreamManager.cpp'), 'utf8');
@@ -36,9 +36,14 @@ assert.ok(!js.includes('tvp-choices'));
 assert.ok(!css.includes('.tvp-choice'));
 
 assert.ok(streamManager.includes('preview.outputHost = "127.0.0.1";'));
+assert.ok(streamManager.includes('privateDemand->fetch_add(1, std::memory_order_relaxed);'));
+assert.ok(streamManager.includes('privateDemand->fetch_sub(1, std::memory_order_relaxed);'));
+assert.ok(streamManager.includes('GST_PAD_PROBE_DROP'));
+assert.ok(streamManager.includes('const bool privatePreview = type == "http"'));
+assert.ok(fs.readFileSync(path.join(__dirname, '../src/StreamManager.h'), 'utf8').includes('privatePreviewDemand'));
 assert.ok(streamManager.includes('preview.outputPort = 0;'));
 assert.ok(streamManager.includes('!found->second->active.load() || !found->second->running.load()'));
 assert.ok(transcoder.includes('output.temporaryPreview ? 1000000000ULL : 3000000000ULL'));
 assert.ok(httpOutput.includes('privatePreview ? 1000000000ULL : 8000000000ULL'));
 assert.ok(httpOutput.includes('privatePreview)'));
-console.log('PASS: HTTP-only preview reuses configured HTTP or authenticated private localhost relay; no protocol picker/HLS fallback; private queues are isolated');
+console.log('PASS: idle in-process private HTTP preview is gated at tee, with active-client lifetime tracking; HTML/player contract preserved');

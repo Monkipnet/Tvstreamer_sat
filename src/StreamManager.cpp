@@ -7517,6 +7517,7 @@ std::string StreamManager::buildPipelineDescription(const StreamConfig& cfg) {
 
 bool StreamManager::addHttpClient(const std::string& id, int fd, const std::string& clientIp) {
     uint16_t relayPort = 0;
+    std::shared_ptr<std::atomic<uint32_t>> privateDemand;
     {
         std::lock_guard<std::mutex> lock(managerMutex);
         auto found = streams.find(id);
@@ -7532,11 +7533,19 @@ bool StreamManager::addHttpClient(const std::string& id, int fd, const std::stri
         // tcpserversink port.  HttpServer owns the public HTTP socket and relays
         // raw MPEG-TS bytes from this local-only endpoint.
         relayPort = tvs::protocols::transcodedHttpInternalPort(found->second->config);
+        // The in-process preview tee probe is demand-controlled. The separate
+        // gst-launch transcoder is not in this process and has no such probe.
+        if (!hasTranscodedHttpOutput(found->second->config) &&
+            !found->second->gstTranscoder) {
+            privateDemand = found->second->privatePreviewDemand;
+            privateDemand->fetch_add(1, std::memory_order_relaxed);
+        }
     }
 
     std::string relayError;
     int upstreamFd = connectLocalTcpWithRetry(relayPort, relayError);
     if (upstreamFd < 0) {
+        if (privateDemand) privateDemand->fetch_sub(1, std::memory_order_relaxed);
         std::cerr << "HTTP relay failed for stream " << id
                   << ": " << relayError << std::endl;
         ::close(fd);
@@ -7550,7 +7559,7 @@ bool StreamManager::addHttpClient(const std::string& id, int fd, const std::stri
     }
 
     try {
-        std::thread([this, id, fd, upstreamFd]() {
+        std::thread([this, id, fd, upstreamFd, privateDemand]() {
             std::array<char, 65536> buffer {};
             while (true) {
                 ssize_t readBytes = ::read(upstreamFd, buffer.data(), buffer.size());
@@ -7563,10 +7572,12 @@ bool StreamManager::addHttpClient(const std::string& id, int fd, const std::stri
             }
             ::close(upstreamFd);
             ::close(fd);
+            if (privateDemand) privateDemand->fetch_sub(1, std::memory_order_relaxed);
             std::lock_guard<std::mutex> relayLock(managerMutex);
             httpClients.erase(fd);
         }).detach();
     } catch (const std::exception& ex) {
+        if (privateDemand) privateDemand->fetch_sub(1, std::memory_order_relaxed);
         std::cerr << "Resource guard: HTTP relay thread creation failed stream="
                   << id << " error=" << ex.what() << std::endl;
         ::close(upstreamFd);
@@ -9119,6 +9130,34 @@ bool StreamManager::buildOutputBranches(StreamState* state, GstElement* pipeline
             std::cerr << "Multi-output branch failed: index=" << i
                       << " type=" << type << " stage=tee-pad-request" << std::endl;
             return false;
+        }
+        // With no HTTP viewers, stop packets at the private branch's tee pad.
+        // In particular, do not run a per-channel tsdemux/mpegtsmux, queues or
+        // timestamp processing merely because 43 channels are on air.
+        // This probe affects ONLY a synthetic localhost preview branch, never
+        // the primary production output or a configured HTTP output.
+        const bool privatePreview = type == "http" &&
+            outputs[i].outputPort == 0 && outputs[i].outputHost == "127.0.0.1";
+        if (privatePreview) {
+            using Demand = std::shared_ptr<std::atomic<uint32_t>>;
+            auto* demand = new Demand(state->privatePreviewDemand);
+            const gulong probeId = gst_pad_add_probe(
+                teeSrcPad,
+                static_cast<GstPadProbeType>(GST_PAD_PROBE_TYPE_BUFFER | GST_PAD_PROBE_TYPE_BUFFER_LIST),
+                [](GstPad*, GstPadProbeInfo*, gpointer context) -> GstPadProbeReturn {
+                    const auto& count = *static_cast<Demand*>(context);
+                    return count->load(std::memory_order_relaxed) == 0
+                        ? GST_PAD_PROBE_DROP : GST_PAD_PROBE_OK;
+                },
+                demand,
+                [](gpointer context) { delete static_cast<Demand*>(context); });
+            if (probeId == 0) {
+                delete demand;
+                gst_element_release_request_pad(tee, teeSrcPad);
+                gst_object_unref(teeSrcPad);
+                gst_object_unref(queueSinkPad);
+                return false;
+            }
         }
         const bool linked = gst_pad_link(teeSrcPad, queueSinkPad) == GST_PAD_LINK_OK;
         if (!linked) gst_element_release_request_pad(tee, teeSrcPad);
