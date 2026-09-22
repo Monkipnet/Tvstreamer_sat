@@ -156,6 +156,27 @@ std::string cleanPathToken(const std::string& value, bool allowDot = false) {
     return cleaned;
 }
 
+// Browser-only libraries are kept on disk next to the program, not loaded from CDN.
+// No preview code is executed until an authenticated administrator opens a tile.
+std::string readPreviewVendorLibrary(const std::string& fileName) {
+    if (fileName != "hls.min.js" && fileName != "mpegts.min.js") return {};
+    std::error_code ec;
+    const std::filesystem::path exe = std::filesystem::read_symlink("/proc/self/exe", ec);
+    if (ec || exe.empty()) return {};
+    const auto binDir = exe.parent_path();
+    for (const auto& filePath : {
+             binDir / "web" / "vendor" / fileName,
+             binDir.parent_path() / "web" / "vendor" / fileName}) {
+        const auto size = std::filesystem::file_size(filePath, ec);
+        if (ec || size < 100000 || size > 5000000) { ec.clear(); continue; }
+        std::ifstream input(filePath, std::ios::binary);
+        if (!input.is_open()) continue;
+        std::string body(size, '\0');
+        if (input.read(body.data(), static_cast<std::streamsize>(size))) return body;
+    }
+    return {};
+}
+
 std::string hlsPublicName(const StreamConfig& cfg) {
     const std::string raw = !cfg.name.empty() ? cfg.name : (!cfg.serviceName.empty() ? cfg.serviceName : cfg.id);
     std::string result;
@@ -768,6 +789,85 @@ void HttpServer::handleSession(tcp::socket socket) {
             } else if (target == "/api/oscam-mini/settings") {
                 res.set(http::field::content_type, "application/json");
                 res.body() = OscamMiniManager::instance().settingsJson();
+            } else if (target == "/preview/hls.min.js" || target == "/preview/mpegts.min.js") {
+                const std::string name = target.substr(std::string("/preview/").size());
+                std::string script = readPreviewVendorLibrary(name);
+                if (script.empty()) {
+                    res.result(http::status::not_found);
+                    res.set(http::field::content_type, "text/plain; charset=UTF-8");
+                    res.body() = "Preview library is not installed. Run scripts/vendor_preview_libs.sh.";
+                } else {
+                    res.set(http::field::content_type, "application/javascript; charset=UTF-8");
+                    res.set(http::field::cache_control, "private, max-age=3600");
+                    res.body() = std::move(script);
+                }
+            } else if (target.rfind("/api/streams/", 0) == 0 &&
+                       target.size() > std::string("/api/streams//preview").size() &&
+                       target.compare(target.size() - std::string("/preview").size(),
+                                      std::string("/preview").size(), "/preview") == 0) {
+                res.set(http::field::content_type, "application/json; charset=UTF-8");
+                res.set(http::field::cache_control, "no-store");
+                const std::string encodedId = target.substr(std::string("/api/streams/").size(),
+                    target.size() - std::string("/api/streams/").size() - std::string("/preview").size());
+                const std::string streamId = urlDecode(encodedId);
+                const StreamConfig* cfg = findStreamConfigById(configManager.config.streams, streamId);
+                if (!cfg || streamId.empty() || streamId.find('/') != std::string::npos) {
+                    res.result(http::status::not_found);
+                    res.body() = R"({"error":"stream_not_found"})";
+                } else {
+                    Json::Value manifest(Json::objectValue);
+                    manifest["stream_id"] = cfg->id;
+                    manifest["name"] = cfg->name;
+                    const bool active = streamManager.isStreamActive(cfg->id);
+                    manifest["active"] = active;
+                    Json::Value sources(Json::arrayValue);
+                    const bool hasHls = hasOutputType(*cfg, "hls");
+                    const bool hasHttp = hasOutputType(*cfg, "http");
+                    const std::string cleanId = cleanPathToken(cfg->id);
+                    const bool safeId = !cleanId.empty() && cleanId == cfg->id;
+                    const std::string hlsUrl = safeId ? "/hls/" + cleanId + "/video.m3u8" : "";
+                    const std::string httpUrl = safeId ? "/stream/" + cleanId + ".ts" : "";
+                    const auto outputs = streamOutputs(*cfg);
+                    for (size_t i = 0; i < outputs.size(); ++i) {
+                        const StreamConfig& output = outputs[i];
+                        const std::string type = normalizedOutputType(output);
+                        Json::Value source(Json::objectValue);
+                        source["id"] = "output-" + std::to_string(i);
+                        source["label"] = (i == 0 ? "Основной" : "Дополнительный " + std::to_string(i)) +
+                                           " · " + type;
+                        source["kind"] = (type == "udp-cbr" || type == "udp-vbr") ? "udp" : type;
+                        source["primary"] = i == 0;
+                        source["details"] = output.outputHost + ":" + std::to_string(output.outputPort);
+                        source["preview_url"] = Json::Value(Json::nullValue);
+                        source["preview_kind"] = "unknown";
+                        if (type == "hls" && !hlsUrl.empty()) {
+                            source["preview_url"] = hlsUrl;
+                            source["preview_kind"] = "hls";
+                        } else if (type == "http" && !httpUrl.empty()) {
+                            // Current server already exposes one HTTP MPEG-TS relay per channel.
+                            source["preview_url"] = httpUrl;
+                            source["preview_kind"] = "mpegts";
+                        } else if (hasHls && !hlsUrl.empty()) {
+                            // Shared media preview of the channel; not a measurement of this
+                            // individual SRT/UDP receiver or network delivery path.
+                            source["preview_url"] = hlsUrl;
+                            source["preview_kind"] = "hls";
+                            source["details"] = source["details"].asString() +
+                                " · общая HLS-медиадорожка (не проверка выхода)";
+                        } else if (hasHttp && !httpUrl.empty()) {
+                            // Only expose an existing HTTP relay, never start a new
+                            // SRT/UDP client or modify a production GStreamer pipeline.
+                            source["preview_url"] = httpUrl;
+                            source["preview_kind"] = "mpegts";
+                            source["details"] = source["details"].asString() +
+                                " · общая HTTP-медиадорожка (не проверка выхода)";
+                        }
+                        sources.append(std::move(source));
+                    }
+                    manifest["sources"] = std::move(sources);
+                    Json::StreamWriterBuilder writer;
+                    res.body() = Json::writeString(writer, manifest);
+                }
             } else if (target == "/api/interfaces") {
                 res.set(http::field::content_type, "application/json");
                 res.body() = listInterfaces();
@@ -3391,6 +3491,21 @@ header{position:fixed;top:0;left:0;right:0;z-index:100000;overflow:visible;displ
 .ui-toast-close:hover{background:#f0444d;transform:scale(1.08)}
 @keyframes ui-toast-in{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:translateY(0)}}
 
+
+/* Embedded browser-preview UI */
+.tvp-overlay { position:fixed;inset:0;z-index:210000;background:rgba(5,12,20,.86);display:flex;align-items:center;justify-content:center;padding:20px;box-sizing:border-box; }
+.tvp-dialog { width:min(100%,1000px);max-height:95vh;overflow:auto;background:#111d2b;color:#f1f5fa;border:1px solid #43556a;border-radius:14px;box-shadow:0 24px 70px #0008;padding:16px;box-sizing:border-box;font:14px/1.45 system-ui,-apple-system,Segoe UI,sans-serif; }
+.tvp-header { display:flex;align-items:center;gap:12px;justify-content:space-between;margin-bottom:12px; }
+.tvp-title { font-size:19px;font-weight:600;margin:0;overflow-wrap:anywhere; }
+.tvp-close { border:0;background:#273d53;color:#fff;border-radius:8px;width:36px;height:36px;cursor:pointer;font-size:27px;line-height:30px;flex:0 0 36px; }
+.tvp-video { display:block;width:100%;max-height:65vh;aspect-ratio:16/9;object-fit:contain;background:#000;border-radius:8px; }
+.tvp-choices { display:flex;gap:8px;flex-wrap:wrap;margin:12px 0; }
+.tvp-choice { padding:7px 12px;text-align:left;background:#24384d;color:#fff;border:1px solid #50647c;border-radius:8px;cursor:pointer;display:flex;flex-direction:column;gap:1px;min-width:110px;max-width:100%; }
+.tvp-choice[aria-pressed="true"] { border-color:#49b6ff;background:#19466c;box-shadow:inset 0 0 0 1px #49b6ff; }
+.tvp-choice-name { font-weight:600;overflow-wrap:anywhere; }.tvp-choice-details { color:#b7c9da;overflow-wrap:anywhere; }
+.tvp-status { margin:0;min-height:1.5em;color:#b8c7d9;overflow-wrap:anywhere; }.tvp-error { color:#ffb7aa; }
+@media(max-width:650px) { .tvp-overlay{padding:4px}.tvp-dialog{padding:10px}.tvp-video{max-height:48vh} }
+
 </style>
 </head>
 <body>
@@ -3436,6 +3551,8 @@ header{position:fixed;top:0;left:0;right:0;z-index:100000;overflow:visible;displ
 <div id="modal" class="modal">
 <div class="modal-content" id="modalContent"></div>
 </div>
+<script src="/preview/hls.min.js" defer></script>
+<script src="/preview/mpegts.min.js" defer></script>
 <script>
 const translations = {
   en: {
@@ -3964,6 +4081,8 @@ function render(force=false) {
     const tile = document.createElement('div');
     tile.className = 'tile' + (stream.active ? ' active' : '');
     tile.dataset.streamId = String(stream.id);
+    tile.dataset.streamName = String(stream.name || stream.id);
+    tile.title = 'Двойной клик — предпросмотр';
     tile.innerHTML = `
       <div class="top">
         <div>
@@ -6347,6 +6466,256 @@ window.addEventListener('beforeunload', () => {
   clearTimeout(statePollTimer);
   clearTimeout(metricsPollTimer);
 });
+
+/* Browser preview is installed on existing tile markup, no new buttons or stream restarts. */
+/* TVStreammerSAT5 browser preview UI. No external player processes. */
+(function (global, factory) {
+  var api = factory();
+  if (typeof module === 'object' && module.exports) module.exports = api;
+  global.TVStreammerPreview = api;
+})(typeof globalThis !== 'undefined' ? globalThis : this, function () {
+  'use strict';
+
+  function cleanKind(value) {
+    var kind = String(value || '').toLowerCase();
+    return ['hls', 'mp4', 'http', 'srt', 'udp', 'mpegts', 'unknown'].includes(kind) ? kind : 'unknown';
+  }
+  function normalizeSources(payload) {
+    var array = Array.isArray(payload) ? payload : payload && payload.sources;
+    if (!Array.isArray(array)) throw Error('Ответ preview API должен содержать массив sources');
+    return array.map(function (s, index) {
+      if (!s || typeof s !== 'object') throw Error('Неверное описание источника #' + index);
+      var kind = cleanKind(s.kind || s.type);
+      // Never use SRT/UDP input addresses as browser playback URLs. A backend
+      // must explicitly supply a browser-ready preview_url for EVERY output.
+      var url = s.preview_url || s.previewUrl || null;
+      var playKind = cleanKind(s.preview_kind || s.previewKind || kind);
+      if (kind === 'srt' || kind === 'udp' || kind === 'mpegts') {
+        if (!s.preview_kind && !s.previewKind) playKind = 'unknown';
+      }
+      return {
+        id: String(s.id == null ? index : s.id),
+        label: String(s.label || s.name || ('Выход ' + (index + 1))),
+        kind: kind,
+        playKind: playKind,
+        url: typeof url === 'string' && url.trim() ? url.trim() : null,
+        details: String(s.details || ''),
+        primary: s.primary === true
+      };
+    });
+  }
+  function safeBrowserUrl(raw, base, allowCrossOrigin) {
+    if (!raw) return null;
+    var u;
+    try { u = new URL(raw, base); } catch (_) { throw Error('Некорректный адрес предпросмотра'); }
+    if (!['http:', 'https:'].includes(u.protocol)) throw Error('Адрес предпросмотра должен быть HTTP(S)');
+    if (!allowCrossOrigin && u.origin !== new URL(base).origin) {
+      throw Error('Предпросмотр должен выдаваться веб-сервером TVStreammer (same-origin)');
+    }
+    return u.href;
+  }
+  function isHls(source) {
+    return source.playKind === 'hls' || /\.m3u8(?:\?|$)/i.test(source.url || '');
+  }
+  function canPreview(source) {
+    if (!source.url) return false;
+    return isHls(source) || source.playKind === 'mp4' || source.playKind === 'http' || source.playKind === 'mpegts';
+  }
+  function element(tag, cls, content) {
+    var n = document.createElement(tag);
+    if (cls) n.className = cls;
+    if (content != null) n.textContent = String(content);
+    return n;
+  }
+  function install(options) {
+    if (typeof document === 'undefined' || typeof window === 'undefined') {
+      throw Error('install() запускается только в браузере');
+    }
+    options = options || {};
+    var selector = options.tileSelector || '[data-stream-id]';
+    var resolve = options.resolve || function (streamId, signal) {
+      return fetch('/api/streams/' + encodeURIComponent(streamId) + '/preview', {
+        credentials: 'same-origin', signal: signal, headers: {'Accept': 'application/json'}
+      }).then(function (response) {
+        if (!response.ok) throw Error('Preview API: HTTP ' + response.status);
+        return response.json();
+      });
+    };
+    var activeHls = null, activeTs = null, activeRequest = null, requestSerial = 0;
+    var modal = null, video = null, controls = null, status = null, title = null;
+    var previousFocus = null, currentSources = [];
+
+    function resetMedia() {
+      if (activeHls) { activeHls.destroy(); activeHls = null; }
+      if (activeTs) { try { activeTs.pause(); activeTs.unload(); activeTs.detachMediaElement(); activeTs.destroy(); } catch (_) {} activeTs = null; }
+      if (video) {
+        video.pause();
+        video.removeAttribute('src');
+        video.load();
+      }
+    }
+    function message(txt, error) {
+      if (status) { status.textContent = txt || ''; status.className = 'tvp-status' + (error ? ' tvp-error' : ''); }
+    }
+    function close() {
+      requestSerial++;
+      if (activeRequest) { activeRequest.abort(); activeRequest = null; }
+      resetMedia();
+      if (modal) { modal.remove(); modal = null; }
+      video = controls = status = title = null;
+      currentSources = [];
+      if (previousFocus && typeof previousFocus.focus === 'function') previousFocus.focus();
+    }
+    function play(source, choiceButton) {
+      resetMedia();
+      Array.prototype.forEach.call(controls.querySelectorAll('button'), function (button) {
+        button.setAttribute('aria-pressed', button === choiceButton ? 'true' : 'false');
+      });
+      if (!source.url) {
+        message('Для выхода «' + source.label + '» сервер не предоставил адрес браузерного предпросмотра. Для SRT/UDP без HLS-выхода нужен отдельный HLS-мост.', true);
+        return;
+      }
+      if (!canPreview(source)) {
+        message('Формат этого выхода недоступен браузеру. Нужен HLS-предпросмотр (H.264/AAC), созданный на сервере.', true);
+        return;
+      }
+      var url;
+      try { url = safeBrowserUrl(source.url, window.location.href, options.allowCrossOrigin === true); }
+      catch (e) { message(e.message, true); return; }
+      video.muted = true;
+      if (source.playKind === 'mpegts') {
+        if (!window.mpegts || !window.mpegts.getFeatureList().mseLivePlayback) {
+          message('Для HTTP MPEG-TS нужна локальная библиотека mpegts.js и поддержка MediaSource браузером.', true);
+          return;
+        }
+        try {
+          var ts = window.mpegts.createPlayer({ type: 'mpegts', isLive: true, url: url },
+            { enableWorker: false, lazyLoad: false, liveBufferLatencyChasing: false });
+          activeTs = ts;
+          ts.on(window.mpegts.Events.ERROR, function (_type, detail) {
+            if (activeTs === ts) message('Ошибка HTTP TS: ' + String(detail || 'нет данных'), true);
+          });
+          ts.attachMediaElement(video);
+          ts.load();
+          message('HTTP MPEG-TS · ' + source.label + ' · звук включается в плеере');
+          Promise.resolve(ts.play()).catch(function () { message('Нажмите ▶ для запуска видео.'); });
+        } catch (error) { resetMedia(); message('Ошибка MPEG-TS: ' + error.message, true); }
+        return;
+      }
+      if (isHls(source)) {
+        if (video.canPlayType('application/vnd.apple.mpegurl')) {
+          video.src = url;
+          message('HLS · ' + source.label + ' · звук включается в плеере' + (source.kind !== 'hls' ? ' · общий медиапредпросмотр, не проверка протокола ' + source.kind.toUpperCase() : ''));
+          video.play().catch(function () { message('Нажмите ▶ для запуска видео.'); });
+          return;
+        }
+        if (window.Hls && window.Hls.isSupported()) {
+          var hls = new window.Hls({ enableWorker: true, backBufferLength: 15 });
+          activeHls = hls;
+          hls.on(window.Hls.Events.ERROR, function (_ev, data) {
+            if (activeHls !== hls) return;
+            if (data && data.fatal) message('Ошибка HLS: ' + (data.details || data.type), true);
+          });
+          hls.on(window.Hls.Events.MANIFEST_PARSED, function () {
+            if (activeHls !== hls) return;
+            message('HLS · ' + source.label + ' · звук включается в плеере' + (source.kind !== 'hls' ? ' · общий медиапредпросмотр, не проверка протокола ' + source.kind.toUpperCase() : ''));
+            video.play().catch(function () { message('Нажмите ▶ для запуска видео.'); });
+          });
+          hls.attachMedia(video);
+          hls.loadSource(url);
+          return;
+        }
+        message('Для этого браузера нужен локальный hls.min.js (см. scripts/vendor_preview_libs.sh).', true);
+        return;
+      }
+      // HTML5 video can play compatible MP4 and certain browser-supported HTTP
+      // formats, but HTTP MPEG-TS is NOT assumed to be browser-compatible.
+      if (source.playKind !== 'mp4' && /\.ts(?:\?|$)/i.test(url)) {
+        message('Непрерывный HTTP MPEG-TS требуется преобразовать в HLS на стороне сервера.', true);
+        return;
+      }
+      video.src = url;
+      message('HTTP · ' + source.label + ' · звук включается в плеере');
+      video.play().catch(function () { message('Нажмите ▶ для запуска видео.'); });
+    }
+    function showSources(payload) {
+      currentSources = normalizeSources(payload);
+      if (!currentSources.length) { message('У плитки нет доступных выходов для предпросмотра.', true); return; }
+      controls.replaceChildren();
+      currentSources.forEach(function (source) {
+        var button = element('button', 'tvp-choice');
+        button.type = 'button';
+        var header = element('span', 'tvp-choice-name', source.label);
+        var detail = element('small', 'tvp-choice-details', [source.kind.toUpperCase(), source.details].filter(Boolean).join(' · '));
+        button.append(header, detail);
+        button.setAttribute('aria-pressed', 'false');
+        button.addEventListener('click', function () { play(source, button); });
+        controls.appendChild(button);
+      });
+      var preferred = currentSources.findIndex(function (s) { return s.primary && canPreview(s); });
+      if (preferred < 0) preferred = currentSources.findIndex(canPreview);
+      if (preferred >= 0) controls.children[preferred].click();
+      else message('Для этой плитки нет готового браузерного HLS/HTTP-предпросмотра. Выберите выход, чтобы увидеть причину.', true);
+    }
+    function open(streamId, streamName) {
+      close();
+      previousFocus = document.activeElement;
+      var serial = requestSerial;
+      modal = element('div', 'tvp-overlay');
+      modal.setAttribute('role', 'presentation');
+      var dialog = element('section', 'tvp-dialog');
+      dialog.setAttribute('role', 'dialog');
+      dialog.setAttribute('aria-modal', 'true');
+      dialog.setAttribute('aria-label', 'Предпросмотр потока');
+      var header = element('div', 'tvp-header');
+      title = element('h2', 'tvp-title', streamName || ('Поток ' + streamId));
+      var closeBtn = element('button', 'tvp-close', '×');
+      closeBtn.type = 'button'; closeBtn.setAttribute('aria-label', 'Закрыть предпросмотр');
+      closeBtn.addEventListener('click', close);
+      header.append(title, closeBtn);
+      video = element('video', 'tvp-video');
+      video.controls = true; video.playsInline = true; video.preload = 'none';
+      video.setAttribute('aria-label', 'Видеоплеер предпросмотра');
+      controls = element('div', 'tvp-choices');
+      controls.setAttribute('role', 'group');
+      controls.setAttribute('aria-label', 'Выбор выходного потока');
+      status = element('div', 'tvp-status', 'Получение списка выходов…');
+      dialog.append(header, video, controls, status);
+      modal.append(dialog);
+      modal.addEventListener('mousedown', function (e) { if (e.target === modal) close(); });
+      document.body.append(modal); closeBtn.focus();
+      activeRequest = new AbortController();
+      Promise.resolve().then(function () { return resolve(streamId, activeRequest.signal); })
+        .then(function (payload) {
+          if (serial !== requestSerial || !modal) return;
+          activeRequest = null;
+          showSources(payload);
+        }).catch(function (error) {
+          if (serial !== requestSerial || !modal || error.name === 'AbortError') return;
+          activeRequest = null;
+          message('Не удалось получить выходы: ' + error.message, true);
+        });
+    }
+    function onDblClick(event) {
+      if (event.target.closest('button, a, input, textarea, select, [contenteditable="true"]')) return;
+      var tile = event.target.closest(selector);
+      if (!tile || !tile.getAttribute('data-stream-id')) return;
+      event.preventDefault();
+      event.stopPropagation();
+      open(tile.getAttribute('data-stream-id'), tile.getAttribute('data-stream-name') || tile.getAttribute('aria-label') || '');
+    }
+    function onKeyDown(event) { if (event.key === 'Escape' && modal) { event.preventDefault(); close(); } }
+    document.addEventListener('dblclick', onDblClick, true);
+    document.addEventListener('keydown', onKeyDown, true);
+    return { open: open, close: close, destroy: function () {
+      close(); document.removeEventListener('dblclick', onDblClick, true);
+      document.removeEventListener('keydown', onKeyDown, true);
+    } };
+  }
+  return { install: install, normalizeSources: normalizeSources, safeBrowserUrl: safeBrowserUrl, canPreview: canPreview };
+});
+
+window.addEventListener('DOMContentLoaded', function () { window.streamPreview = TVStreammerPreview.install({tileSelector: '.tile[data-stream-id]'}); });
 </script>
 </body>
 </html>
