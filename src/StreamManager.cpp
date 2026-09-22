@@ -7524,7 +7524,7 @@ bool StreamManager::addHttpClient(const std::string& id, int fd, const std::stri
             ::close(fd);
             return false;
         }
-        if (!hasTranscodedHttpOutput(found->second->config)) {
+        if (!found->second->active.load() || !found->second->running.load()) {
             ::close(fd);
             return false;
         }
@@ -9016,7 +9016,23 @@ bool StreamManager::buildOutputBranches(StreamState* state, GstElement* pipeline
         return false;
     }
 
-    const auto outputs = pipelineOutputConfigs(state->config);
+    auto outputs = pipelineOutputConfigs(state->config);
+    // 203.67 preview: provide an isolated, localhost-only MPEG-TS relay when
+    // the channel has no configured HTTP output. It is part of this channel's
+    // existing pipeline generation: no new input, transcoder or restart when
+    // the browser opens/closes. With zero viewers tcpserversink sends no bytes.
+    // Do not mutate state->config: this is NOT a public additional output.
+    if (!hasTranscodedHttpOutput(state->config) &&
+        hasElementFactory("tee") && hasElementFactory("tcpserversink")) {
+        StreamConfig preview = state->config;
+        preview.outputType = "http";
+        preview.outputMode = "listener";
+        preview.outputHost = "127.0.0.1";
+        preview.outputPort = 0; // actual private port: transcodedHttpInternalPort(id)
+        preview.additionalOutputs.clear();
+        preview.cbr = false; // do not add a second byte-rate controller
+        outputs.push_back(std::move(preview));
+    }
     if (outputs.empty()) {
         return false;
     }

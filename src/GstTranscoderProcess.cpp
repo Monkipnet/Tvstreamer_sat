@@ -152,7 +152,8 @@ std::string findMp3Encoder() {
     return {};
 }
 
-void addQueue(std::vector<std::string>& args, const std::string& name, uint64_t maxTimeNs = 5000000000ULL) {
+void addQueue(std::vector<std::string>& args, const std::string& name,
+              uint64_t maxTimeNs = 5000000000ULL, bool leaky = false) {
     args.insert(args.end(), {
         "queue",
         "name=" + name,
@@ -160,6 +161,7 @@ void addQueue(std::vector<std::string>& args, const std::string& name, uint64_t 
         "max-size-bytes=0",
         "max-size-time=" + std::to_string(maxTimeNs)
     });
+    if (leaky) args.push_back("leaky=downstream");
 }
 
 std::string property(const std::string& name, const std::string& value) {
@@ -483,6 +485,7 @@ bool appendTranscoderDecodeInput(
 struct SharedOutputBranch {
     GstOutputSpec spec;
     std::size_t index = 0;
+    bool temporaryPreview = false;
 };
 
 void uniquifyOutputFragment(
@@ -667,7 +670,9 @@ void appendSharedEncodedOutputBranches(
         const bool rtsp = output.spec.container == ContainerKind::Rtsp;
 
         args.insert(args.end(), {"transcode_video_encoded_tee.", "!"});
-        addQueue(args, "transcode_video_mux_queue" + suffix, 3000000000ULL);
+        addQueue(args, "transcode_video_mux_queue" + suffix,
+                 output.temporaryPreview ? 1000000000ULL : 3000000000ULL,
+                 output.temporaryPreview);
         args.insert(args.end(), {
             "!", "h264parse", property("config-interval", "-1"),
             "!", flv
@@ -677,7 +682,9 @@ void appendSharedEncodedOutputBranches(
         });
 
         args.insert(args.end(), {"transcode_audio_encoded_tee.", "!"});
-        addQueue(args, "transcode_audio_mux_queue" + suffix, 3000000000ULL);
+        addQueue(args, "transcode_audio_mux_queue" + suffix,
+                 output.temporaryPreview ? 1000000000ULL : 3000000000ULL,
+                 output.temporaryPreview);
         if (audioCodec == "mp3") {
             args.insert(args.end(), {
                 "!", "mpegaudioparse",
@@ -922,6 +929,8 @@ std::vector<std::string> GstTranscoderProcess::buildSharedCommand(
         SharedOutputBranch branch;
         branch.spec = std::move(outputSpec);
         branch.index = index;
+        branch.temporaryPreview = tvs::protocols::normalizedOutputType(outputConfig) == "http" &&
+            outputConfig.outputPort == 0 && outputConfig.outputHost == "127.0.0.1";
         outputs.push_back(std::move(branch));
     }
     descriptionStream << "]";
@@ -960,7 +969,25 @@ bool GstTranscoderProcess::start(const StreamConfig& config, std::string& error)
         return false;
     }
 
-    const auto outputs = tvs::protocols::outputConfigs(config);
+    auto outputs = tvs::protocols::outputConfigs(config);
+    // 203.67 preview: share decoded/encoded A/V with the existing child process.
+    // The private HTTP sink has no clients until an authenticated admin opens
+    // the preview. No second source, decoder or video/audio encoder is launched.
+    const bool hasHttp = std::any_of(outputs.begin(), outputs.end(),
+        [](const StreamConfig& output) {
+            return tvs::protocols::normalizedOutputType(output) == "http";
+        });
+    if (!hasHttp && hasFactory("tcpserversink") && hasFactory("mpegtsmux") &&
+        hasFactory("tsparse")) {
+        StreamConfig preview = config;
+        preview.outputType = "http";
+        preview.outputMode = "listener";
+        preview.outputHost = "127.0.0.1";
+        preview.outputPort = 0;
+        preview.additionalOutputs.clear();
+        preview.cbr = false;
+        outputs.push_back(std::move(preview));
+    }
     if (outputs.empty()) {
         error = "no outputs configured";
         return false;

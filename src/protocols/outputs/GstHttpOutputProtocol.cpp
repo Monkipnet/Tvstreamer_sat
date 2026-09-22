@@ -17,7 +17,10 @@ bool appendHttpSink(std::vector<std::string>& args, const StreamConfig& cfg, Gst
         "!"
     });
     appendCbrPacer(args, cfg, "transcode_http_byte_cbr_pacer");
-    appendOutputQueueWithTime(args, "transcode_http_output_queue", 8000000000ULL, false);
+    const bool privatePreview = cfg.outputPort == 0 && cfg.outputHost == "127.0.0.1";
+    appendOutputQueueWithTime(args, "transcode_http_output_queue",
+                              privatePreview ? 1000000000ULL : 8000000000ULL,
+                              privatePreview);
     const int internalPort = static_cast<int>(transcodedHttpInternalPort(cfg));
     args.insert(args.end(), {
         "tcpserversink",

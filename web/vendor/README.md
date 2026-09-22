@@ -1,7 +1,7 @@
-# Offline browser-player libraries
+# Local browser-preview library
 
-Run `bash scripts/vendor_preview_libs.sh` **once on a development/build machine with Internet access** to download pinned hls.js and mpegts.js UMD builds and their Apache-2.0 license texts here. Commit these generated files together with the TVStreammer code. The TVStreammer server serves them from its own `/preview/` paths; the browser needs no CDN and no external media player.
+The HTTP-only browser preview uses `mpegts.min.js` (mpegts.js, UMD build) and the browser's MediaSource support. Keep the built JS file at `web/vendor/mpegts.min.js` in the project and deploy it under `web/vendor/` alongside the executable. The browser receives it from `/preview/mpegts.min.js`; no external player or browser-side CDN is used.
 
-For a built binary in `build/TVStreammerSAT5`, these files must be under `web/vendor/` in the project root. For a deployed `/opt/TVStreammerSAT5/TVStreammerSAT5` binary, place them at `/opt/TVStreammerSAT5/web/vendor/`.
+If the library is not already present, `bash scripts/vendor_preview_libs.sh` fetches the pinned library and its license on an Internet-connected build machine. The script may also fetch hls.js for compatibility with older builds; this HTTP-only preview does not load hls.js.
 
-The project archive does not contain upstream hls.js/mpegts.js builds because the package was assembled without access to download their distributable files; use the vendor script before deploying browser preview. Safari native-HLS may play `.m3u8` without hls.js.
+Existing checked-in `web/vendor/*.js` files on a Git working copy must NOT be deleted or overwritten by unpacking an archive that omits them. Apply the supplied source patch instead.
