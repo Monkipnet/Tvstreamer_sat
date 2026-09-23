@@ -4,9 +4,9 @@
 
 TVStreammerSAT5 - сервер маршрутизации, мониторинга и преобразования телевизионных потоков на базе C++17 и GStreamer. Программа принимает сетевые и спутниковые источники, формирует один или несколько выходов для каждого канала и управляется через встроенную русско-английскую веб-панель.
 
-![Основная панель TVStreammerSAT5](docs/screenshots/dashboard.png)
+![Основная панель TVStreammerSAT5](./docs/screenshots/dashboard.png)
 
-![Управление OSCam-mini](docs/screenshots/oscam-mini.png)
+![Управление OSCam-mini](./docs/screenshots/oscam-mini.png)
 
 ## Возможности
 
