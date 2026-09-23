@@ -5,6 +5,8 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <memory>
+#include "UdpMediaDeliveryHealth.h"
 #include <string>
 
 #include "ConfigManager.h"
@@ -40,6 +42,7 @@ GstElement* createSink(
     const StreamConfig& config,
     const std::string& sinkName,
     std::string& error,
-    std::atomic<uint64_t>* networkBytes = nullptr);
+    std::atomic<uint64_t>* networkBytes = nullptr,
+    std::shared_ptr<UdpMediaDeliveryHealth> mediaHealth = nullptr);
 
 } // namespace StableUdpOutput

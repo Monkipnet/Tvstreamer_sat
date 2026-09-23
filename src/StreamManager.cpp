@@ -8706,6 +8706,10 @@ GstElement* StreamManager::createPipeline(StreamState* state) {
     }
 
     state->outputContexts.clear();
+    {
+        std::lock_guard<std::mutex> lock(state->udpMediaHealthMutex);
+        state->udpMediaHealth.clear();
+    }
     if (cfg.transcodeEnabled) {
         if (cfg.transcodeVideoCodec == "copy" || cfg.transcodeAudioCodec == "copy") {
             std::cerr << "Transcoder 202.73: in-process mixed/passthrough mode"
@@ -10081,7 +10085,25 @@ GstElement* StreamManager::createOutputSink(StreamState* state, const StreamConf
         std::atomic<uint64_t>* networkBytes = claimNetworkTelemetry
             ? &state->stableUdpNetworkBytes
             : nullptr;
-        GstElement* sink = StableUdpOutput::createSink(pipeline, cfg, sinkName, error, networkBytes);
+        std::shared_ptr<UdpMediaDeliveryHealth> udpHealth;
+        // Only count actual successful UDP sends for remapped, non-transcoded
+        // HTTP/SRT streams with explicit output media PIDs. Unknown PID maps
+        // are not guessed; existing upstream/NULL watchdogs still apply.
+        if (state && udpCbrOutputEnabled(cfg) && cfg.remapEnabled && !cfg.transcodeEnabled &&
+            (cfg.videoPid > 0 || cfg.audioPid > 0) &&
+            (tvs::stream_protocols::inputKind(state->runtimeConfig) ==
+                 tvs::stream_protocols::InputProtocolKind::Http ||
+             tvs::stream_protocols::inputKind(state->runtimeConfig) ==
+                 tvs::stream_protocols::InputProtocolKind::Srt)) {
+            udpHealth = std::make_shared<UdpMediaDeliveryHealth>();
+            udpHealth->outputEndpoint = cfg.outputHost + ":" + std::to_string(cfg.outputPort);
+        }
+        GstElement* sink = StableUdpOutput::createSink(
+            pipeline, cfg, sinkName, error, networkBytes, udpHealth);
+        if (sink && udpHealth) {
+            std::lock_guard<std::mutex> lock(state->udpMediaHealthMutex);
+            state->udpMediaHealth.push_back(std::move(udpHealth));
+        }
         if (!sink) {
             std::cerr << error << std::endl;
         } else if (claimNetworkTelemetry) {
@@ -11252,6 +11274,10 @@ void StreamManager::monitorBus(const std::string& id) {
         return;
     }
 
+    const auto configuredOutputs20370 = outputConfigs(state->config);
+    const bool hasUdpCbrOutput20370 = std::any_of(
+        configuredOutputs20370.begin(), configuredOutputs20370.end(),
+        [](const StreamConfig& output) { return udpCbrOutputEnabled(output); });
     const auto configuredInputKind = tvs::stream_protocols::inputKind(state->config);
     if (configuredInputKind == tvs::stream_protocols::InputProtocolKind::Srt) {
         const int watchdogLatencyMs = tvs::protocols::srt_vps::latencyMs(state->config, 500);
@@ -11315,6 +11341,26 @@ void StreamManager::monitorBus(const std::string& id) {
     auto mediaReturnOutputGraceUntil = std::chrono::steady_clock::time_point::min();
     auto lastMediaPipelineRecovery = std::chrono::steady_clock::time_point::min();
     auto lastNetworkMediaReconnect20369 = std::chrono::steady_clock::time_point::min();
+    // A source-byte event is not sufficient to announce that the UDP program
+    // has recovered. Hold the primary-source Telegram event until successful
+    // UDP datagrams carry NEW media (and readable video PTS if available).
+    bool pendingPrimaryUdpConfirmation20370 = false;
+    uint64_t pendingPrimaryGeneration20370 = 0;
+    struct UdpDeliveryWatch20370 {
+        const UdpMediaDeliveryHealth* generation = nullptr;
+        uint64_t mediaPacketsSeen = 0;
+        uint64_t videoPesStartsSeen = 0;
+        uint64_t videoPtsAdvancesSeen = 0;
+        uint64_t videoPtsEpochStart = 0;
+        bool mediaEstablished = false;
+        std::chrono::steady_clock::time_point firstSeen =
+            std::chrono::steady_clock::time_point::min();
+        std::chrono::steady_clock::time_point lastMediaProgress =
+            std::chrono::steady_clock::time_point::min();
+        std::chrono::steady_clock::time_point lastVideoPtsProgress =
+            std::chrono::steady_clock::time_point::min();
+    };
+    std::map<const UdpMediaDeliveryHealth*, UdpDeliveryWatch20370> udpDeliveryWatches20370;
     uint64_t lastVideoPtsAdvancesSeen20369 =
         state->inputTsVideoPtsAdvances.load(std::memory_order_relaxed);
     uint64_t videoPtsEpochStart20369 = lastVideoPtsAdvancesSeen20369;
@@ -11798,12 +11844,20 @@ void StreamManager::monitorBus(const std::string& id) {
             state->lastInputBytesSeen = currentInputBytes;
             state->lastInputActivity = now;
             if (state->inputLossNotified && !state->usingBackup && !state->primaryRetryPending) {
-                state->statusMessage = "running";
-                notifyStreamState(
-                    state->config,
-                    "🟢",
-                    telegramText(configManager, "Входной сигнал восстановлен", "Input signal restored"),
-                    telegramText(configManager, "Активный источник: основной", "Active source: primary") + "\nURL: " + state->activeInputUri);
+                if (recoverableNetworkInput && hasUdpCbrOutput20370) {
+                    state->statusMessage = "input bytes returned; UDP media unverified";
+                    notifyStreamState(
+                        state->config, "🟡",
+                        telegramText(configManager, "Входные данные поступают; UDP ещё проверяется",
+                            "Input bytes returned; UDP media is not yet verified"),
+                        telegramText(configManager, "Активный источник: основной", "Active source: primary") + "\nURL: " + state->activeInputUri);
+                } else {
+                    state->statusMessage = "running";
+                    notifyStreamState(
+                        state->config, "🟢",
+                        telegramText(configManager, "Входной сигнал восстановлен", "Input signal restored"),
+                        telegramText(configManager, "Активный источник: основной", "Active source: primary") + "\nURL: " + state->activeInputUri);
+                }
             }
             state->inputLossNotified = false;
             networkLossWarningActive = false;
@@ -11817,14 +11871,18 @@ void StreamManager::monitorBus(const std::string& id) {
                     std::chrono::steady_clock::time_point::min();
                 std::cerr << "NETWORK RECOVERY 202.66: stream=" << id
                           << " protocol=" << (srtInput ? "SRT" : "HTTP-MPEGTS")
-                          << " result=source-reconnect-media-restored"
+                          << (hasUdpCbrOutput20370
+                                  ? " result=input-returned-udp-unverified"
+                                  : " result=source-reconnect-media-restored")
                           << " action=normal-watchdog-resumed" << std::endl;
             }
             if (recoverableNetworkInput) {
                 if (networkRecoveryAttempts > 0) {
                     std::cerr << "NETWORK INPUT RECOVERY 202.55: stream=" << id
                               << " protocol=" << (srtInput ? "SRT" : "HTTP-MPEGTS")
-                              << " result=media-restored attempts="
+                              << (hasUdpCbrOutput20370
+                                      ? " result=input-returned-udp-unverified attempts="
+                                      : " result=media-restored attempts=")
                               << networkRecoveryAttempts << std::endl;
                 }
                 networkRecoveryPending = false;
@@ -11848,12 +11906,36 @@ void StreamManager::monitorBus(const std::string& id) {
             if (state->primaryRetryPending && !state->usingBackup) {
                 state->primaryRetryPending = false;
                 state->backupAttempted = false;
-                state->statusMessage = "running on primary";
-                notifyStreamState(
-                    state->config,
-                    "🟢",
-                    telegramText(configManager, "Основной поток восстановлен", "Primary stream restored"),
-                    telegramText(configManager, "Активный источник: основной", "Active source: primary") + "\nURL: " + state->activeInputUri);
+                if (recoverableNetworkInput && hasUdpCbrOutput20370 &&
+                    state->config.remapEnabled && !state->config.transcodeEnabled) {
+                    {
+                        std::lock_guard<std::mutex> lock(state->udpMediaHealthMutex);
+                        pendingPrimaryUdpConfirmation20370 = !state->udpMediaHealth.empty();
+                    }
+                    pendingPrimaryGeneration20370 =
+                        state->mediaPipelineGeneration.load(std::memory_order_acquire);
+                    state->statusMessage = "primary input returned; checking UDP media";
+                    std::cerr << "PRIMARY RECOVERY 203.70: stream=" << id
+                              << " stage=input-returned action="
+                              << (pendingPrimaryUdpConfirmation20370
+                                  ? "wait-udp-media-proof" : "udp-validation-unavailable")
+                              << std::endl;
+                    if (!pendingPrimaryUdpConfirmation20370) {
+                        notifyStreamState(
+                            state->config, "🟡",
+                            telegramText(configManager,
+                                "Основной вход восстановлен; UDP-поток не проверен",
+                                "Primary input returned; UDP output was not verified"),
+                            telegramText(configManager, "Активный источник: основной", "Active source: primary") +
+                                "\nURL: " + state->activeInputUri);
+                    }
+                } else {
+                    state->statusMessage = "running on primary";
+                    notifyStreamState(
+                        state->config, "🟢",
+                        telegramText(configManager, "Основной поток восстановлен", "Primary stream restored"),
+                        telegramText(configManager, "Активный источник: основной", "Active source: primary") + "\nURL: " + state->activeInputUri);
+                }
             }
         }
         maybeLogSrtInputStats(state, now);
@@ -11870,6 +11952,11 @@ void StreamManager::monitorBus(const std::string& id) {
             mediaOutageEpochStarted = std::chrono::steady_clock::time_point::min();
             mediaReturnOutputGraceUntil = std::chrono::steady_clock::time_point::min();
             finalTsWatch20366.clear();
+            udpDeliveryWatches20370.clear();
+            if (pendingPrimaryUdpConfirmation20370 &&
+                pendingPrimaryGeneration20370 != mediaGenerationNow20369) {
+                pendingPrimaryUdpConfirmation20370 = false;
+            }
             lastVideoPtsAdvancesSeen20369 =
                 state->inputTsVideoPtsAdvances.load(std::memory_order_relaxed);
             videoPtsEpochStart20369 = lastVideoPtsAdvancesSeen20369;
@@ -11999,6 +12086,157 @@ void StreamManager::monitorBus(const std::string& id) {
             }
             bus = state->bus;
             std::cerr << "MEDIA WATCH 203.69: stream=" << id
+                      << " result=reconnect-failed cooldown_s=60" << std::endl;
+        }
+
+        // 203.70: the earlier outputTsPayloadPackets probe sits BEFORE the
+        // StableUdpOutput CBR reservoir. A successful PCR lock or nonzero
+        // pre-sender payload cannot prove useful media continues over UDP.
+        // Sample each actual successful UDP send independently; NULL/PAT/PMT
+        // and a constant video PTS never advance the delivered-video clock.
+        std::vector<std::shared_ptr<UdpMediaDeliveryHealth>> udpOutputs20370;
+        {
+            std::lock_guard<std::mutex> lock(state->udpMediaHealthMutex);
+            udpOutputs20370 = state->udpMediaHealth;
+        }
+        bool allUdpOutputsVerified20370 = !udpOutputs20370.empty();
+        bool anyUdpFault20370 = false;
+        const char* udpFaultReason20370 = nullptr;
+        std::string udpFaultEndpoint20370;
+        uint64_t udpFaultMediaPackets20370 = 0;
+        uint64_t udpFaultVideoPtsAdvances20370 = 0;
+        uint64_t udpFaultSentDatagrams20370 = 0;
+        long long udpFaultGapMs20370 = 0;
+        for (const auto& health : udpOutputs20370) {
+            if (!health) continue;
+            auto& watch = udpDeliveryWatches20370[health.get()];
+            const uint64_t deliveredMedia = health->mediaPackets.load(std::memory_order_relaxed);
+            const uint64_t deliveredVideoPes = health->videoPesStarts.load(std::memory_order_relaxed);
+            const uint64_t deliveredVideoPts = health->videoPtsAdvances.load(std::memory_order_relaxed);
+            if (watch.generation != health.get() ||
+                deliveredMedia < watch.mediaPacketsSeen ||
+                deliveredVideoPts < watch.videoPtsAdvancesSeen) {
+                watch = UdpDeliveryWatch20370{};
+                watch.generation = health.get();
+                watch.firstSeen = now;
+                watch.lastMediaProgress = now;
+                watch.lastVideoPtsProgress = now;
+                watch.videoPtsEpochStart = deliveredVideoPts;
+            }
+            if (deliveredMedia > watch.mediaPacketsSeen) {
+                watch.mediaPacketsSeen = deliveredMedia;
+                watch.lastMediaProgress = now;
+                watch.mediaEstablished = true;
+            }
+            if (deliveredVideoPts > watch.videoPtsAdvancesSeen) {
+                watch.videoPtsAdvancesSeen = deliveredVideoPts;
+                watch.lastVideoPtsProgress = now;
+            }
+            watch.videoPesStartsSeen = deliveredVideoPes;
+            const auto startupAge = now - watch.firstSeen;
+            const auto deliveredMediaGap = now - watch.lastMediaProgress;
+            const auto deliveredVideoPtsGap = now - watch.lastVideoPtsProgress;
+            const bool upstreamVideoAdvancing = videoPtsEstablished20369 &&
+                now - lastVideoPtsProgress20369 < std::chrono::seconds(3);
+            const bool outputVideoEstablished =
+                deliveredVideoPts >= watch.videoPtsEpochStart &&
+                deliveredVideoPts - watch.videoPtsEpochStart >= 2;
+            // Require multiple output observations separated in wall time: a
+            // one-off reservoir burst must not produce a recovery Telegram.
+            const bool deliveredMediaConfirmed = watch.mediaEstablished &&
+                startupAge >= std::chrono::seconds(3) &&
+                deliveredMediaGap < std::chrono::seconds(2) &&
+                deliveredMedia >= 2;
+            if (!deliveredMediaConfirmed ||
+                (upstreamVideoAdvancing &&
+                 (!outputVideoEstablished ||
+                  deliveredVideoPtsGap >= std::chrono::seconds(3)))) {
+                allUdpOutputsVerified20370 = false;
+            }
+            const auto fault20370 = tvs::udp_media_delivery::classifyFault({
+                networkMediaEligible20369 && mediaWatchEligible &&
+                    hasUdpCbrOutput20370 && reconnectCooldownDone20369 &&
+                    now - state->lastPrimaryRetry >= kNetworkMediaStartupGrace20369,
+                inputMediaRecent,
+                upstreamVideoAdvancing,
+                watch.mediaEstablished,
+                outputVideoEstablished,
+                deliveredVideoPes,
+                std::chrono::duration_cast<std::chrono::milliseconds>(startupAge).count(),
+                std::chrono::duration_cast<std::chrono::milliseconds>(deliveredMediaGap).count(),
+                std::chrono::duration_cast<std::chrono::milliseconds>(deliveredVideoPtsGap).count()
+            });
+            const char* fault = tvs::udp_media_delivery::faultReason(fault20370);
+            if (fault && !anyUdpFault20370) {
+                anyUdpFault20370 = true;
+                udpFaultReason20370 = fault;
+                udpFaultEndpoint20370 = health->outputEndpoint;
+                udpFaultMediaPackets20370 = deliveredMedia;
+                udpFaultVideoPtsAdvances20370 = deliveredVideoPts;
+                udpFaultSentDatagrams20370 =
+                    health->sentDatagrams.load(std::memory_order_relaxed);
+                udpFaultGapMs20370 =
+                    std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::string(fault) ==
+                            "input-video-pts-advancing-udp-video-pts-stalled"
+                            ? deliveredVideoPtsGap : deliveredMediaGap).count();
+            }
+        }
+        if (pendingPrimaryUdpConfirmation20370 && !state->usingBackup &&
+            pendingPrimaryGeneration20370 == mediaGenerationNow20369 &&
+            allUdpOutputsVerified20370 && inputMediaRecent) {
+            pendingPrimaryUdpConfirmation20370 = false;
+            state->statusMessage = "running on primary; UDP media verified";
+            std::cerr << "PRIMARY RECOVERY 203.70: stream=" << id
+                      << " stage=udp-media-verified action=notify-primary-restored"
+                      << std::endl;
+            notifyStreamState(
+                state->config, "🟢",
+                telegramText(configManager,
+                    "Основной источник: новые медиаданные передаются на UDP",
+                    "Primary source: new media is being sent over UDP"),
+                telegramText(configManager, "Активный источник: основной", "Active source: primary") +
+                    "\nURL: " + state->activeInputUri);
+        }
+        if (anyUdpFault20370) {
+            const std::string recoveryUri = state->activeInputUri.empty()
+                ? state->primaryInputUri : state->activeInputUri;
+            const bool recoverBackup = state->usingBackup;
+            std::cerr << "UDP MEDIA WATCH 203.70: stream=" << id
+                      << " output=" << udpFaultEndpoint20370
+                      << " reason=" << udpFaultReason20370
+                      << " delivered_media_packets=" << udpFaultMediaPackets20370
+                      << " delivered_video_pts_advances=" << udpFaultVideoPtsAdvances20370
+                      << " sent_datagrams=" << udpFaultSentDatagrams20370
+                      << " gap_ms=" << udpFaultGapMs20370
+                      << " action=full-pipeline-reconnect-only-this-stream" << std::endl;
+            lastNetworkMediaReconnect20369 = now;
+            lastMediaPipelineRecovery = now;
+            pendingPrimaryUdpConfirmation20370 = false;
+            if (!recoveryUri.empty() && restartActiveInput(state, recoveryUri, recoverBackup)) {
+                bus = state->bus;
+                state->lastInputMediaPacketsSeen =
+                    state->inputTsMediaPackets.load(std::memory_order_relaxed);
+                state->lastOutputMediaPacketsSeen =
+                    state->outputTsPayloadPackets.load(std::memory_order_relaxed);
+                state->lastInputMediaActivity = now;
+                state->lastOutputMediaActivity = now;
+                state->lastInputActivity = now;
+                state->lastInputBytesSeen =
+                    state->inputBytes.load(std::memory_order_relaxed);
+                networkRecoveryPending = false;
+                networkRecoveryAttempts = 0;
+                networkRecoveryDue = std::chrono::steady_clock::time_point::min();
+                mediaOutputEstablished = false;
+                mediaOutageEpochActive = false;
+                mediaReturnOutputGraceUntil = std::chrono::steady_clock::time_point::min();
+                state->statusMessage = "UDP media stalled; reconnecting channel";
+                std::cerr << "UDP MEDIA WATCH 203.70: stream=" << id
+                          << " result=reconnect-started" << std::endl;
+                continue;
+            }
+            bus = state->bus;
+            std::cerr << "UDP MEDIA WATCH 203.70: stream=" << id
                       << " result=reconnect-failed cooldown_s=60" << std::endl;
         }
 

@@ -17,6 +17,7 @@
 #include <vector>
 
 #include "ConfigManager.h"
+#include "UdpMediaDeliveryHealth.h"
 #include "GstTranscoderProcess.h"
 #include "TelegramNotifier.h"
 #include "utils.h"
@@ -271,6 +272,11 @@ struct StreamState {
     // immediately publishes only the new generation's branch objects.
     std::mutex finalNetupTsHealthMutex;
     std::vector<std::shared_ptr<FinalNetupTsHealth>> finalNetupTsHealth;
+    // Actual successful UDP datagram delivery, one object per UDP output.
+    // Old senders may finish after their generation is retired; shared_ptr
+    // keeps their counters alive without making them visible as current.
+    std::mutex udpMediaHealthMutex;
+    std::vector<std::shared_ptr<UdpMediaDeliveryHealth>> udpMediaHealth;
     std::array<uint8_t, 8192> outputContinuity {};
     std::array<bool, 8192> outputContinuityValid {};
     std::vector<uint8_t> outputTsRemainder;

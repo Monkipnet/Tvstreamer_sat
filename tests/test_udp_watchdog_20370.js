@@ -1,0 +1,17 @@
+'use strict';
+const fs = require('fs');
+const assert = require('assert').strict;
+const stream = fs.readFileSync('src/StreamManager.cpp','utf8');
+const sender = fs.readFileSync('src/StableUdpOutput.cpp','utf8');
+const header = fs.readFileSync('src/UdpMediaDeliveryHealth.h','utf8');
+assert.match(sender, /const ssize_t sent = ::sendto/);
+assert.match(sender, /if \(mediaHealth\)/);
+assert.match(sender, /inspectSuccessfulDatagram\(/);
+assert.match(stream, /UDP MEDIA WATCH 203\.70/);
+assert.match(stream, /udp_media_delivery::classifyFault/);
+assert.match(stream, /faultReason\(fault20370\)/);
+assert.match(stream, /allUdpOutputsVerified20370 && inputMediaRecent/);
+assert.match(stream, /pendingPrimaryUdpConfirmation20370/);
+assert.match(stream, /restartActiveInput\(state, recoveryUri, recoverBackup\)/);
+assert.match(header, /pid == 0x1fff/);
+console.log('PASS: 203.70 post-send UDP media/PTS watchdog, primary confirmation and channel-local recovery wiring');

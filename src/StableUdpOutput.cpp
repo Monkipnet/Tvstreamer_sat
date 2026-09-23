@@ -775,13 +775,20 @@ std::size_t findPatOffset(const guint8* data, std::size_t size, std::size_t mini
 
 class StableUdpSender {
 public:
-    StableUdpSender(GstElement* pipeline, const StreamConfig& cfg, std::string& error, std::atomic<uint64_t>* networkBytesCounter)
+    StableUdpSender(GstElement* pipeline, const StreamConfig& cfg, std::string& error,
+                    std::atomic<uint64_t>* networkBytesCounter,
+                    std::shared_ptr<UdpMediaDeliveryHealth> outputHealth)
         : streamId(cfg.id),
           ownerPipeline(pipeline),
           srtInput(tvs::protocols::inputs::isSrtInput(cfg)),
           tvStreamer5IpProfile(useTvStreamer5IpShaperProfile(cfg)),
           srtRemapCbrSourcePcr(useSrtRemapCbrSourcePcr(cfg)),
           networkBytes(networkBytesCounter),
+          mediaHealth(std::move(outputHealth)),
+          monitoredVideoPid(cfg.videoPid > 0 && cfg.videoPid < 0x1fff ?
+              static_cast<uint16_t>(cfg.videoPid) : static_cast<uint16_t>(0)),
+          monitoredAudioPid(cfg.audioPid > 0 && cfg.audioPid < 0x1fff ?
+              static_cast<uint16_t>(cfg.audioPid) : static_cast<uint16_t>(0)),
           preSendCcTrace(cfg.id, "PRE_SEND"),
           diagnosticsEnabled(tsDiagnosticsEnabled()),
           caCleanStartEnabled(!useTvStreamer5IpShaperProfile(cfg)),
@@ -3420,6 +3427,20 @@ private:
         if (networkBytes) {
             networkBytes->fetch_add(static_cast<uint64_t>(sent), std::memory_order_relaxed);
         }
+        if (mediaHealth) {
+            // Count only bytes accepted by sendto(), never the input mux or the
+            // synthetic CBR transport. No synchronous log/lock on this path.
+            const auto progress = tvs::udp_media_delivery::inspectSuccessfulDatagram(
+                data, size, monitoredVideoPid, monitoredAudioPid,
+                outputPtsKnown, previousOutputPts90k);
+            mediaHealth->sentDatagrams.fetch_add(1, std::memory_order_relaxed);
+            if (progress.mediaPackets) mediaHealth->mediaPackets.fetch_add(
+                progress.mediaPackets, std::memory_order_relaxed);
+            if (progress.videoPesStarts) mediaHealth->videoPesStarts.fetch_add(
+                progress.videoPesStarts, std::memory_order_relaxed);
+            if (progress.videoPtsAdvances) mediaHealth->videoPtsAdvances.fetch_add(
+                progress.videoPtsAdvances, std::memory_order_relaxed);
+        }
     }
 
     void maybeLogStats(uint64_t nowNanoseconds) {
@@ -3542,6 +3563,11 @@ private:
     const bool tvStreamer5IpProfile = false;
     const bool srtRemapCbrSourcePcr = false;
     std::atomic<uint64_t>* networkBytes = nullptr;
+    std::shared_ptr<UdpMediaDeliveryHealth> mediaHealth;
+    const uint16_t monitoredVideoPid = 0;
+    const uint16_t monitoredAudioPid = 0;
+    bool outputPtsKnown = false; // only the sender thread updates these
+    uint64_t previousOutputPts90k = 0;
     TsCcStageTrace preSendCcTrace;
     const bool diagnosticsEnabled = false;
     const bool caCleanStartEnabled = false;
@@ -3803,7 +3829,8 @@ GstElement* createSink(
     const StreamConfig& config,
     const std::string& sinkName,
     std::string& error,
-    std::atomic<uint64_t>* networkBytes) {
+    std::atomic<uint64_t>* networkBytes,
+    std::shared_ptr<UdpMediaDeliveryHealth> mediaHealth) {
     const UdpShapingMode mode = udpShapingMode(config);
     if (mode == UdpShapingMode::Cbr && config.targetBitrate == 0) {
         error = "UDP CBR target_bitrate must be greater than zero";
@@ -3821,7 +3848,7 @@ GstElement* createSink(
         return nullptr;
     }
 
-    auto* sender = new StableUdpSender(pipeline, config, error, networkBytes);
+    auto* sender = new StableUdpSender(pipeline, config, error, networkBytes, std::move(mediaHealth));
     if (!sender->isReady()) {
         delete sender;
         gst_bin_remove(GST_BIN(pipeline), sink);
