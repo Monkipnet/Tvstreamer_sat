@@ -1,4 +1,5 @@
 #include "StreamManager.h"
+#include "TsMediaProgress.h"
 #include "TranscoderModule.h"
 #include "StableUdpOutput.h"
 #include "NetupOutputPacer.h"
@@ -116,6 +117,13 @@ constexpr auto kMediaPipelineRecoveryCooldown = std::chrono::seconds(15);
 // When real media returns, rebuild this stream exactly once to discard stale
 // demux/remap/reservoir state and start a clean TS epoch.
 constexpr auto kMediaOutageEpochDelay = std::chrono::seconds(5);
+// 203.69: HTTP and SRT CBR can keep delivering NULL/PSI or stale video
+// indefinitely. Check transport/media clocks independently and avoid repeated
+// full-channel reconnects during a persistent upstream outage.
+constexpr auto kNetworkMediaMissingDelay20369 = std::chrono::seconds(18);
+constexpr auto kNetworkVideoPtsStallDelay20369 = std::chrono::seconds(18);
+constexpr auto kNetworkMediaReconnectCooldown20369 = std::chrono::seconds(60);
+constexpr auto kNetworkMediaStartupGrace20369 = std::chrono::seconds(20);
 // 203.66: final-output health is sampled after the NETUP reservoir pacer.  A
 // live input carrying real A/V must never be allowed to leave the network
 // branch as an almost-all-NULL transport indefinitely.  Wait through normal
@@ -4117,12 +4125,15 @@ struct InputMediaCount {
     uint64_t mediaPackets = 0;
     uint64_t nullPackets = 0;
     uint64_t mediaPesStarts = 0;
+    uint64_t videoPtsAdvances = 0;
 };
 
 void seedConfiguredInputMediaPids(StreamState* state) {
     if (!state || state->inputTelemetryMediaPidsKnown) return;
-    if (state->config.videoPid > 0 && state->config.videoPid < 0x1FFF)
+    if (state->config.videoPid > 0 && state->config.videoPid < 0x1FFF) {
         state->inputTelemetryMediaPids[state->config.videoPid] = true;
+        state->inputTelemetryVideoPids[state->config.videoPid] = true;
+    }
     if (state->config.audioPid > 0 && state->config.audioPid < 0x1FFF)
         state->inputTelemetryMediaPids[state->config.audioPid] = true;
 }
@@ -4159,6 +4170,7 @@ void discoverInputMediaPids(const uint8_t* packet, StreamState* state) {
     if (12 + programInfoLength > end) return;
 
     std::array<bool, 8192> discovered {};
+    std::array<bool, 8192> discoveredVideo {};
     size_t mediaCount = 0;
     size_t pos = 12 + programInfoLength;
     while (pos + 5 <= end) {
@@ -4170,12 +4182,14 @@ void discoverInputMediaPids(const uint8_t* packet, StreamState* state) {
         if (elementaryPid < 0x1FFF &&
             (isVideoStreamType(streamType) || isAudioStreamType(streamType, descriptors, esInfoLength))) {
             discovered[elementaryPid] = true;
+            if (isVideoStreamType(streamType)) discoveredVideo[elementaryPid] = true;
             ++mediaCount;
         }
         pos += 5 + esInfoLength;
     }
     if (mediaCount > 0) {
         state->inputTelemetryMediaPids = discovered;
+        state->inputTelemetryVideoPids = discoveredVideo;
         state->inputTelemetryMediaPidsKnown = true;
     }
 }
@@ -4221,6 +4235,19 @@ InputMediaCount countInputMedia(const guint8* data, std::size_t size, StreamStat
             if (payloadOffset + 3 <= kTsPacketSize &&
                 packet[payloadOffset] == 0x00 && packet[payloadOffset + 1] == 0x00 && packet[payloadOffset + 2] == 0x01) {
                 ++count.mediaPesStarts;
+                if (state->inputTelemetryVideoPids[pid]) {
+                    uint64_t pts90k = 0;
+                    if (tvs::ts_media_progress::videoPesPts90k(packet, kTsPacketSize, pts90k)) {
+                        // Compare per elementary PID, not across multiple video
+                        // tracks. PTS may wrap; only a *change* is required.
+                        if (state->inputVideoPtsKnown[pid] &&
+                            state->inputVideoPts90k[pid] != pts90k) {
+                            ++count.videoPtsAdvances;
+                        }
+                        state->inputVideoPtsKnown[pid] = true;
+                        state->inputVideoPts90k[pid] = pts90k;
+                    }
+                }
             }
         }
     }
@@ -4245,6 +4272,7 @@ void updateInputMediaStats(StreamState* state, GstBuffer* buffer) {
     if (count.mediaPackets) state->inputTsMediaPackets.fetch_add(count.mediaPackets, std::memory_order_relaxed);
     if (count.nullPackets) state->inputTsNullPackets.fetch_add(count.nullPackets, std::memory_order_relaxed);
     if (count.mediaPesStarts) state->inputTsMediaPesStarts.fetch_add(count.mediaPesStarts, std::memory_order_relaxed);
+    if (count.videoPtsAdvances) state->inputTsVideoPtsAdvances.fetch_add(count.videoPtsAdvances, std::memory_order_relaxed);
 }
 
 void updateInputMediaStats(StreamState* state, GstBufferList* list) {
@@ -8344,6 +8372,7 @@ bool StreamManager::restartPipelineWithInput(StreamState* state, const std::stri
     GstBus* newBus = gst_element_get_bus(newPipeline);
     state->pipeline = newPipeline;
     state->bus = newBus;
+    state->mediaPipelineGeneration.fetch_add(1, std::memory_order_release);
     state->usingBackup = useBackup;
     state->backupAttempted = useBackup;
     state->primaryRetryPending = !useBackup;
@@ -8375,6 +8404,17 @@ bool StreamManager::restartPipelineWithInput(StreamState* state, const std::stri
     state->lastInputCcErrorsSample = 0;
     state->lastOutputCcErrorsSample = 0;
     state->lastInputBytesSeen = 0;
+    // The previous source may use different media PIDs and a different PES
+    // timeline. Drop its PID/PTS discovery before the replacement starts.
+    {
+        std::lock_guard<std::mutex> lock(state->inputMediaMutex);
+        state->inputMediaRemainder.clear();
+        state->inputTelemetryPmtPid = 0x1FFF;
+        state->inputTelemetryMediaPids.fill(false);
+        state->inputTelemetryVideoPids.fill(false);
+        state->inputTelemetryMediaPidsKnown = false;
+        state->inputVideoPtsKnown.fill(false);
+    }
     {
         std::lock_guard<std::mutex> lock(state->inputContinuityMutex);
         state->inputContinuityValid.fill(false);
@@ -11274,6 +11314,12 @@ void StreamManager::monitorBus(const std::string& id) {
     bool mediaOutputEstablished = false;
     auto mediaReturnOutputGraceUntil = std::chrono::steady_clock::time_point::min();
     auto lastMediaPipelineRecovery = std::chrono::steady_clock::time_point::min();
+    auto lastNetworkMediaReconnect20369 = std::chrono::steady_clock::time_point::min();
+    uint64_t lastVideoPtsAdvancesSeen20369 =
+        state->inputTsVideoPtsAdvances.load(std::memory_order_relaxed);
+    uint64_t videoPtsEpochStart20369 = lastVideoPtsAdvancesSeen20369;
+    auto lastVideoPtsProgress20369 = std::chrono::steady_clock::now();
+    auto mediaGenerationSeen20369 = state->mediaPipelineGeneration.load(std::memory_order_acquire);
     // 203.65: remember a real-media outage across a still-live NULL/PSI CBR
     // transport. Recovery is edge-triggered: one rebuild when media returns.
     bool mediaOutageEpochActive = false;
@@ -11812,6 +11858,24 @@ void StreamManager::monitorBus(const std::string& id) {
         }
         maybeLogSrtInputStats(state, now);
 
+        // A recovery can replace the whole pipeline while the monitor retains
+        // its local health epoch. Never inherit a previous source's established
+        // media / PTS history when the newly selected input is still starting.
+        const auto mediaGenerationNow20369 =
+            state->mediaPipelineGeneration.load(std::memory_order_acquire);
+        if (mediaGenerationNow20369 != mediaGenerationSeen20369) {
+            mediaGenerationSeen20369 = mediaGenerationNow20369;
+            mediaOutputEstablished = false;
+            mediaOutageEpochActive = false;
+            mediaOutageEpochStarted = std::chrono::steady_clock::time_point::min();
+            mediaReturnOutputGraceUntil = std::chrono::steady_clock::time_point::min();
+            finalTsWatch20366.clear();
+            lastVideoPtsAdvancesSeen20369 =
+                state->inputTsVideoPtsAdvances.load(std::memory_order_relaxed);
+            videoPtsEpochStart20369 = lastVideoPtsAdvancesSeen20369;
+            lastVideoPtsProgress20369 = now;
+        }
+
         // 203.64: inputBytes measures transport, not useful media.  A CBR SRT
         // sender can keep inputBytes moving forever with NULL packets after an
         // upstream UDP outage. Track discovered input media PIDs independently
@@ -11837,7 +11901,7 @@ void StreamManager::monitorBus(const std::string& id) {
             activeInputKind == tvs::stream_protocols::InputProtocolKind::Rtp;
         const bool mediaWatchEligible =
             !state->config.testPattern && !state->config.transcodeEnabled &&
-            state->config.remapEnabled && (srtInput || udpLikeInput);
+            state->config.remapEnabled && (recoverableNetworkInput || udpLikeInput);
         const bool transportRecent =
             now - state->lastInputActivity < std::chrono::seconds(2);
         const bool inputMediaSeen = currentInputMediaPackets > 0;
@@ -11845,6 +11909,98 @@ void StreamManager::monitorBus(const std::string& id) {
             inputMediaSeen && now - state->lastInputMediaActivity < std::chrono::seconds(2);
         const auto inputMediaGap = now - state->lastInputMediaActivity;
         const auto outputMediaGap = now - state->lastOutputMediaActivity;
+        const uint64_t videoPtsNow20369 =
+            state->inputTsVideoPtsAdvances.load(std::memory_order_relaxed);
+        if (videoPtsNow20369 != lastVideoPtsAdvancesSeen20369) {
+            lastVideoPtsAdvancesSeen20369 = videoPtsNow20369;
+            lastVideoPtsProgress20369 = now;
+        }
+        const bool videoPtsEstablished20369 =
+            videoPtsNow20369 >= videoPtsEpochStart20369 &&
+            videoPtsNow20369 - videoPtsEpochStart20369 >= 2;
+
+        // A CBR output can report its configured bitrate even with zero media.
+        // For HTTP/SRT only, detect a NULL/PSI-only *input* that stays alive,
+        // and a video PES stream that repeats an unchanged PTS. The original
+        // no-byte watchdog remains responsible when transport itself is gone.
+        const bool networkMediaEligible20369 =
+            !state->config.testPattern && !state->config.transcodeEnabled &&
+            recoverableNetworkInput && transportRecent &&
+            !networkRecoveryGraceActive && !sourceReconnectInFlight &&
+            state->running.load(std::memory_order_relaxed);
+        const bool inputMediaMissing20369 =
+            networkMediaEligible20369 && !inputMediaRecent &&
+            inputMediaGap >= kNetworkMediaMissingDelay20369 &&
+            now - state->lastInputActivity < std::chrono::seconds(2);
+        const bool videoPtsStalled20369 =
+            networkMediaEligible20369 && inputMediaRecent &&
+            videoPtsEstablished20369 &&
+            now - lastVideoPtsProgress20369 >= kNetworkVideoPtsStallDelay20369;
+        // If a source has genuine media but a CBR program never produces its
+        // first output packet, the old watchdog's mediaOutputEstablished gate
+        // would keep the channel in permanent startup limbo.
+        const bool outputNeverStarted20369 =
+            networkMediaEligible20369 && mediaWatchEligible && inputMediaRecent &&
+            udpCbrOutputEnabled(state->config) && !mediaOutputEstablished &&
+            currentOutputMediaPackets == 0 &&
+            now - state->lastOutputMediaActivity >= kNetworkMediaStartupGrace20369;
+        const bool reconnectCooldownDone20369 =
+            lastNetworkMediaReconnect20369 == std::chrono::steady_clock::time_point::min() ||
+            now - lastNetworkMediaReconnect20369 >= kNetworkMediaReconnectCooldown20369;
+        if ((inputMediaMissing20369 || videoPtsStalled20369 ||
+             outputNeverStarted20369) &&
+            reconnectCooldownDone20369 &&
+            now - state->lastPrimaryRetry >= kNetworkMediaStartupGrace20369) {
+            const std::string reason20369 = inputMediaMissing20369
+                ? "transport-live-input-media-missing"
+                : (videoPtsStalled20369 ? "input-video-pts-not-advancing"
+                                       : "input-media-live-output-never-started");
+            const std::string recoveryUri = state->activeInputUri.empty()
+                ? state->primaryInputUri : state->activeInputUri;
+            const bool recoverBackup = state->usingBackup;
+            std::cerr << "MEDIA WATCH 203.69: stream=" << id
+                      << " protocol=" << tvs::stream_protocols::inputKindName(activeInputKind)
+                      << " reason=" << reason20369
+                      << " input_media_gap_ms="
+                      << std::chrono::duration_cast<std::chrono::milliseconds>(inputMediaGap).count()
+                      << " video_pts_gap_ms="
+                      << std::chrono::duration_cast<std::chrono::milliseconds>(
+                             now - lastVideoPtsProgress20369).count()
+                      << " input_bytes=" << currentInputBytes
+                      << " input_null_packets="
+                      << state->inputTsNullPackets.load(std::memory_order_relaxed)
+                      << " input_media_packets=" << currentInputMediaPackets
+                      << " output_media_packets=" << currentOutputMediaPackets
+                      << " action=full-pipeline-reconnect-only-this-stream" << std::endl;
+            lastNetworkMediaReconnect20369 = now;
+            lastMediaPipelineRecovery = now;
+            if (!recoveryUri.empty() && restartActiveInput(state, recoveryUri, recoverBackup)) {
+                bus = state->bus;
+                state->lastInputMediaPacketsSeen =
+                    state->inputTsMediaPackets.load(std::memory_order_relaxed);
+                state->lastOutputMediaPacketsSeen =
+                    state->outputTsPayloadPackets.load(std::memory_order_relaxed);
+                state->lastInputMediaActivity = now;
+                state->lastOutputMediaActivity = now;
+                state->lastInputActivity = now;
+                state->lastInputBytesSeen =
+                    state->inputBytes.load(std::memory_order_relaxed);
+                mediaOutputEstablished = false;
+                mediaOutageEpochActive = false;
+                mediaReturnOutputGraceUntil = std::chrono::steady_clock::time_point::min();
+                mediaTransportOnlyLogged = false;
+                networkRecoveryPending = false;
+                networkRecoveryAttempts = 0;
+                networkRecoveryDue = std::chrono::steady_clock::time_point::min();
+                state->statusMessage = "media watchdog: reconnecting source";
+                std::cerr << "MEDIA WATCH 203.69: stream=" << id
+                          << " result=reconnect-started" << std::endl;
+                continue;
+            }
+            bus = state->bus;
+            std::cerr << "MEDIA WATCH 203.69: stream=" << id
+                      << " result=reconnect-failed cooldown_s=60" << std::endl;
+        }
 
         // 203.66: inspect each strict SRT/HTTP branch after its NETUP reservoir.
         // If real input media is flowing but the exact final branch is almost

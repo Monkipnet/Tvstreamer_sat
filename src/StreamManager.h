@@ -250,11 +250,17 @@ struct StreamState {
     std::atomic<uint64_t> inputTsMediaPackets{0};
     std::atomic<uint64_t> inputTsNullPackets{0};
     std::atomic<uint64_t> inputTsMediaPesStarts{0};
+    // Source-side PES PTS progress, independent of CBR NULL-padding or UI bitrate.
+    std::atomic<uint64_t> inputTsVideoPtsAdvances{0};
+    std::atomic<uint64_t> mediaPipelineGeneration{0};
     std::vector<uint8_t> inputMediaRemainder;
     std::vector<uint8_t> inputMediaScratch;
     std::mutex inputMediaMutex;
     uint16_t inputTelemetryPmtPid = 0x1FFF;
     std::array<bool, 8192> inputTelemetryMediaPids {};
+    std::array<bool, 8192> inputTelemetryVideoPids {};
+    std::array<bool, 8192> inputVideoPtsKnown {};
+    std::array<uint64_t, 8192> inputVideoPts90k {};
     bool inputTelemetryMediaPidsKnown = false;
     uint64_t lastInputMediaPacketsSeen = 0;
     uint64_t lastOutputMediaPacketsSeen = 0;

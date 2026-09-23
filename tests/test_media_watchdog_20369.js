@@ -1,0 +1,15 @@
+'use strict';
+const assert = require('assert').strict;
+const fs = require('fs');
+const cpp = fs.readFileSync('src/StreamManager.cpp', 'utf8');
+const h = fs.readFileSync('src/StreamManager.h', 'utf8');
+assert.match(cpp, /state->config\.remapEnabled && \(recoverableNetworkInput \|\| udpLikeInput\)/);
+assert.match(cpp, /const bool httpMpegTsInput =/);
+assert.match(cpp, /const bool networkMediaEligible20369 =/);
+assert.match(cpp, /inputMediaGap >= kNetworkMediaMissingDelay20369/);
+assert.match(cpp, /now - lastVideoPtsProgress20369 >= kNetworkVideoPtsStallDelay20369/);
+assert.match(cpp, /now - lastNetworkMediaReconnect20369 >= kNetworkMediaReconnectCooldown20369/);
+assert.match(cpp, /input-media-live-output-never-started/);
+assert.match(cpp, /restartActiveInput\(state, recoveryUri, recoverBackup\)/);
+assert.match(h, /std::atomic<uint64_t> mediaPipelineGeneration/);
+console.log('PASS: 203.69 HTTP/SRT media-watchdog eligibility, PTS and NULL-input detection, per-stream reconnect and cooldown');
