@@ -1,284 +1,329 @@
 #!/usr/bin/env bash
+# TVStreammerSAT5 203.68 — safe binary + web installer / updater for Ubuntu/Debian.
 set -Eeuo pipefail
+umask 022
 
-# TVStreammerSAT5 binary installer for Ubuntu/Debian.
-# Run this script from a folder that contains either:
-#   TVStreammerSAT5
-#   tvstreammersat5-ca-newcamd.so                  (optional)
-#   oscam-mini/oscam-mini                         (optional)
-# or from the project root after a build, where those files live under build/.
-#
-# The installer intentionally preserves existing configuration/data files.
-# It records packages newly installed by this run so uninstall_tvstreammersat5.sh
-# can remove only installer-added dependencies instead of purging arbitrary
-# pre-existing system packages.
-
-APP_NAME="TVStreammerSAT5"
-SERVICE_NAME="tvstreammersat5.service"
-OSCAM_SERVICE_NAME="oscam-mini.service"
-INSTALL_DIR="${TVS_INSTALL_DIR:-/opt/TVStreammerSAT5}"
-STATE_DIR="${TVS_INSTALLER_STATE_DIR:-/var/lib/tvstreammersat5-installer}"
-SOURCE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-START_SERVICE=1
+APP=TVStreammerSAT5
+UNIT=tvstreammersat5.service
+DEFAULT_INSTALL_DIR=/opt/TVStreammerSAT5
+SOURCE_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+INSTALL_DIR="${TVS_INSTALL_DIR:-}"
+INSTALL_DIR_EXPLICIT=0
+[[ -n "$INSTALL_DIR" ]] && INSTALL_DIR_EXPLICIT=1
+BUILD_DIR=''
+WEB_DIR=''
+MODE=''
+RESTART=''
 DRY_RUN=0
+INSTALL_DEPS=''
+WITH_OSCAM=0
 
 usage() {
-    cat <<'USAGE'
-Usage: sudo ./install_tvstreammersat5_binary.sh [options]
+    cat <<'EOF'
+TVStreammerSAT5 installer / updater (binary + web + optional CA plugin).
+Usage: sudo bash install_tvstreammersat5_binary_20368.sh [options]
 
-Options:
-  --source DIR      Folder containing binaries, or project root with build/
-  --install-dir DIR Application directory (default: /opt/TVStreammerSAT5)
-  --no-start        Install but do not start services
-  --dry-run         Show what would be done without changing the system
+  --source DIR       Project root containing web/ and a compiled binary
+  --build-dir DIR    Exact CMake build directory (recommended for updates)
+  --web-dir DIR      Exact directory containing preview/ and vendor/
+  --install-dir DIR  Installation directory; existing systemd WorkingDirectory
+                     is detected when possible (fallback /opt/TVStreammerSAT5)
+  --mode install|update    Skip the interactive mode selection
+  --restart         Start/restart the main service AFTER updating (interrupts streams)
+  --no-restart      Deploy files WITHOUT restarting the service
+  --install-deps    Install Ubuntu/Debian packages (new installs only by default)
+  --skip-deps       Do not run apt (update default)
+  --with-oscam      Also install supplied oscam-mini executable, if found
+  --dry-run         Preview decisions and source paths; NO system changes
+  --no-start        Alias for --no-restart (compatibility)
   -h, --help        Show this help
-USAGE
+
+WARNING: Updating an active service requires a maintenance window. The script
+never stops/restarts it without explicit confirmation or --restart.
+Existing channel configuration, databases, keys and customized systemd units
+are not overwritten. Backups of overwritten application files are retained.
+EOF
 }
 
-while [[ $# -gt 0 ]]; do
+while (($#)); do
     case "$1" in
-        --source)
-            [[ $# -ge 2 ]] || { echo "--source requires a directory" >&2; exit 2; }
-            SOURCE_DIR="$(cd "$2" && pwd)"
-            shift 2
-            ;;
-        --install-dir)
-            [[ $# -ge 2 ]] || { echo "--install-dir requires a directory" >&2; exit 2; }
-            INSTALL_DIR="$2"
-            shift 2
-            ;;
-        --no-start)
-            START_SERVICE=0
-            shift
-            ;;
-        --dry-run)
-            DRY_RUN=1
-            shift
-            ;;
-        -h|--help)
-            usage
-            exit 0
-            ;;
-        *)
-            echo "Unknown option: $1" >&2
-            usage >&2
-            exit 2
-            ;;
+        --source|--build-dir|--web-dir|--install-dir|--mode)
+            (($# >= 2)) || { echo "ERROR: $1 requires a value" >&2; exit 2; }
+            case "$1" in
+                --source) SOURCE_DIR="$2" ;;
+                --build-dir) BUILD_DIR="$2" ;;
+                --web-dir) WEB_DIR="$2" ;;
+                --install-dir) INSTALL_DIR="$2"; INSTALL_DIR_EXPLICIT=1 ;;
+                --mode) MODE="$2" ;;
+            esac
+            shift 2 ;;
+        --restart) RESTART=yes; shift ;;
+        --no-restart|--no-start) RESTART=no; shift ;;
+        --install-deps) INSTALL_DEPS=yes; shift ;;
+        --skip-deps) INSTALL_DEPS=no; shift ;;
+        --with-oscam) WITH_OSCAM=1; shift ;;
+        --dry-run) DRY_RUN=1; shift ;;
+        -h|--help) usage; exit 0 ;;
+        *) echo "ERROR: unknown option $1" >&2; usage >&2; exit 2 ;;
     esac
 done
 
-if [[ "${EUID}" -ne 0 ]]; then
-    if command -v sudo >/dev/null 2>&1; then
-        args=(--source "$SOURCE_DIR" --install-dir "$INSTALL_DIR")
-        [[ "$START_SERVICE" -eq 0 ]] && args+=(--no-start)
-        [[ "$DRY_RUN" -eq 1 ]] && args+=(--dry-run)
-        exec sudo -E bash "$0" "${args[@]}"
+fail() { echo "ERROR: $*" >&2; exit 1; }
+log() { printf '\n==> %s\n' "$*"; }
+ask_yes() {
+    local answer
+    [[ -t 0 ]] || fail 'A confirmation is required. Run interactively or provide --restart / --no-restart.'
+    read -r -p "$1 [y/N]: " answer
+    case "$answer" in y|Y|yes|YES|Yes|д|Д|да|Да|ДА) return 0 ;; *) return 1 ;; esac
+}
+
+[[ "$MODE" == '' || "$MODE" == install || "$MODE" == update ]] || fail 'Use --mode install or --mode update.'
+[[ -d "$SOURCE_DIR" ]] || fail "Source directory does not exist: $SOURCE_DIR"
+SOURCE_DIR="$(cd -- "$SOURCE_DIR" && pwd -P)"
+
+# Existing customized service files are not changed. Detect /opt/tvstreammersat5
+# instead of accidentally installing to a different case-sensitive /opt path.
+if (( ! INSTALL_DIR_EXPLICIT )) && command -v systemctl >/dev/null 2>&1; then
+    detected="$(systemctl show "$UNIT" -p WorkingDirectory --value 2>/dev/null || true)"
+    if [[ -n "$detected" && -f "$detected/$APP" ]]; then
+        INSTALL_DIR="$detected"
     fi
-    echo "Run as root or install sudo first." >&2
-    exit 1
+fi
+INSTALL_DIR="${INSTALL_DIR:-$DEFAULT_INSTALL_DIR}"
+[[ "$INSTALL_DIR" == /* && "$INSTALL_DIR" != / ]] || fail 'Installation directory must be an absolute path other than /.'
+if [[ -e "$INSTALL_DIR" ]]; then
+    [[ -d "$INSTALL_DIR" && ! -L "$INSTALL_DIR" ]] || fail 'Installation directory must be a real directory, not a symlink.'
+    INSTALL_DIR="$(cd -- "$INSTALL_DIR" && pwd -P)"
 fi
 
-if ! command -v apt-get >/dev/null 2>&1 || ! command -v dpkg-query >/dev/null 2>&1; then
-    echo "This installer requires an apt-based Ubuntu/Debian system." >&2
-    exit 1
+existing=no
+[[ -f "$INSTALL_DIR/$APP" ]] && existing=yes
+if [[ -z "$MODE" ]]; then
+    [[ -t 0 ]] || fail 'Specify --mode install or --mode update when running non-interactively.'
+    printf '\nChoose operation:\n  1) New installation\n  2) Update existing installation\n  0) Cancel\n'
+    read -r -p 'Enter 1, 2 or 0: ' selection
+    case "$selection" in 1) MODE=install ;; 2) MODE=update ;; *) fail 'Cancelled.' ;; esac
+fi
+if [[ "$MODE" == update && "$existing" != yes ]]; then
+    fail "No existing executable found at $INSTALL_DIR/$APP; choose the correct --install-dir."
+fi
+if [[ "$MODE" == install && "$existing" == yes ]]; then
+    fail "Existing installation found at $INSTALL_DIR; choose update to preserve it."
 fi
 
-run() {
-    if [[ "$DRY_RUN" -eq 1 ]]; then
-        printf '+ '
-        printf '%q ' "$@"
-        printf '\n'
-    else
-        "$@"
-    fi
-}
-
-first_existing() {
-    local path
-    for path in "$@"; do
-        if [[ -f "$path" ]]; then
-            printf '%s\n' "$path"
-            return 0
-        fi
-    done
-    return 1
-}
-
-first_existing_dir() {
-    local path
-    for path in "$@"; do
-        if [[ -d "$path" ]]; then
-            printf '%s\n' "$path"
-            return 0
-        fi
-    done
-    return 1
-}
-
-MAIN_BINARY="$(first_existing \
-    "$SOURCE_DIR/TVStreammerSAT5" \
-    "$SOURCE_DIR/build/TVStreammerSAT5" || true)"
-CA_PLUGIN="$(first_existing \
-    "$SOURCE_DIR/tvstreammersat5-ca-newcamd.so" \
-    "$SOURCE_DIR/build/tvstreammersat5-ca-newcamd.so" || true)"
-OSCAM_BINARY="$(first_existing \
-    "$SOURCE_DIR/oscam-mini/oscam-mini" \
-    "$SOURCE_DIR/build/oscam-mini/oscam-mini" \
-    "$SOURCE_DIR/oscam-mini" || true)"
-OSCAM_SERVICE="$(first_existing \
-    "$SOURCE_DIR/oscam-mini/oscam-mini.service" \
-    "$SOURCE_DIR/packaging/oscam-mini/oscam-mini.service" \
-    "$SOURCE_DIR/oscam-mini.service" || true)"
-OSCAM_DEFAULT_CONFIG="$(first_existing_dir \
-    "$SOURCE_DIR/oscam-mini/default-config" \
-    "$SOURCE_DIR/packaging/oscam-mini/default-config" \
-    "$SOURCE_DIR/default-config" || true)"
-
-if [[ -z "$MAIN_BINARY" ]]; then
-    cat >&2 <<EOFERR
-TVStreammerSAT5 binary not found in:
-  $SOURCE_DIR/TVStreammerSAT5
-  $SOURCE_DIR/build/TVStreammerSAT5
-
-Build first with:
-  cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
-  cmake --build build --parallel "\$(nproc)"
-EOFERR
-    exit 1
+# Avoid selecting an unrelated/stale build just because it happens to exist.
+if [[ -n "$BUILD_DIR" ]]; then
+    [[ "$BUILD_DIR" == /* ]] || BUILD_DIR="$SOURCE_DIR/$BUILD_DIR"
+    [[ -d "$BUILD_DIR" ]] || fail "Build directory does not exist: $BUILD_DIR"
+    BINARY="$BUILD_DIR/$APP"
+    PLUGIN="$BUILD_DIR/tvstreammersat5-ca-newcamd.so"
+elif [[ -f "$SOURCE_DIR/$APP" ]]; then
+    BINARY="$SOURCE_DIR/$APP"
+    PLUGIN="$SOURCE_DIR/tvstreammersat5-ca-newcamd.so"
+elif [[ -f "$SOURCE_DIR/build/$APP" ]]; then
+    BINARY="$SOURCE_DIR/build/$APP"
+    PLUGIN="$SOURCE_DIR/build/tvstreammersat5-ca-newcamd.so"
+else
+    fail "No executable in $SOURCE_DIR or its build/ directory. Specify --build-dir build-preview-20368-fixed."
 fi
-
+[[ -f "$BINARY" && -s "$BINARY" ]] || fail "Compiled executable missing or empty: $BINARY"
+[[ -x "$BINARY" ]] || fail "Binary is not executable: $BINARY"
 if command -v file >/dev/null 2>&1; then
-    if ! file "$MAIN_BINARY" | grep -q 'ELF'; then
-        echo "Main binary is not an ELF executable: $MAIN_BINARY" >&2
-        exit 1
-    fi
+    file -b "$BINARY" | grep -q ELF || fail "Not an ELF binary: $BINARY"
+fi
+[[ -f "$PLUGIN" && -s "$PLUGIN" ]] || PLUGIN=''
+
+[[ -n "$WEB_DIR" ]] || WEB_DIR="$SOURCE_DIR/web"
+[[ "$WEB_DIR" == /* ]] || WEB_DIR="$SOURCE_DIR/$WEB_DIR"
+[[ -d "$WEB_DIR" ]] || fail "web directory missing: $WEB_DIR"
+[[ -s "$WEB_DIR/preview/preview-player.js" && -s "$WEB_DIR/preview/preview-player.css" ]] || \
+    fail "Preview assets are missing from $WEB_DIR/preview"
+
+# A source ZIP may contain only vendor/README.md. Preserve the already-installed
+# mpegts.min.js on update; do not deploy a preview that cannot play HTTP MPEG-TS.
+MPEGTS_SOURCE=''
+if [[ -s "$WEB_DIR/vendor/mpegts.min.js" ]]; then
+    MPEGTS_SOURCE="$WEB_DIR/vendor/mpegts.min.js"
+elif [[ -s "$INSTALL_DIR/web/vendor/mpegts.min.js" ]]; then
+    MPEGTS_SOURCE="$INSTALL_DIR/web/vendor/mpegts.min.js"
+else
+    fail "web/vendor/mpegts.min.js missing in source AND installed web. Fetch it first with: bash scripts/vendor_preview_libs.sh"
+fi
+[[ "$(wc -c < "$MPEGTS_SOURCE")" -ge 100000 ]] || fail "mpegts.min.js is unexpectedly small: $MPEGTS_SOURCE"
+
+OSCAM_BINARY=''
+if (( WITH_OSCAM )); then
+    for candidate in "$SOURCE_DIR/oscam-mini/oscam-mini" "$SOURCE_DIR/build/oscam-mini/oscam-mini" "$BUILD_DIR/oscam-mini/oscam-mini"; do
+        if [[ -f "$candidate" && -x "$candidate" ]]; then OSCAM_BINARY="$candidate"; break; fi
+    done
+    [[ -n "$OSCAM_BINARY" ]] || fail '--with-oscam requested but no compiled oscam-mini executable was found.'
 fi
 
-TMP_DIR="$(mktemp -d)"
-trap 'rm -rf "$TMP_DIR"' EXIT
-BEFORE_PACKAGES="$TMP_DIR/packages.before"
-AFTER_PACKAGES="$TMP_DIR/packages.after"
-NEW_PACKAGES="$TMP_DIR/packages.new"
-
-dpkg-query -W -f='${binary:Package}\n' 2>/dev/null | sort -u > "$BEFORE_PACKAGES"
-
-# Runtime stack required by the current TVStreammerSAT5 binary and its external
-# GStreamer transcoder process. Development package names are deliberately used
-# for a few libraries because they are stable across Ubuntu 22.04/24.04 and pull
-# the matching versioned runtime library automatically.
-DEPENDENCIES=(
-    ca-certificates
-    libcurl4-openssl-dev
-    libjsoncpp-dev
-    libssl-dev
-    libcrypt-dev
-    libdvbcsa-dev
-    libboost-thread-dev
-    gstreamer1.0-tools
-    gstreamer1.0-plugins-base
-    gstreamer1.0-plugins-good
-    gstreamer1.0-plugins-bad
-    gstreamer1.0-plugins-ugly
-    gstreamer1.0-libav
-    gstreamer1.0-rtsp
-    gstreamer1.0-vaapi
-    vainfo
-    intel-media-va-driver
-)
-
-printf 'Source directory : %s\n' "$SOURCE_DIR"
-printf 'Install directory: %s\n' "$INSTALL_DIR"
-printf 'Main binary      : %s\n' "$MAIN_BINARY"
-printf 'CA plugin        : %s\n' "${CA_PLUGIN:-not found / skipped}"
-printf 'OSCam-mini       : %s\n' "${OSCAM_BINARY:-not found / skipped}"
-
-echo "Installing runtime dependencies..."
-run apt-get update
-run env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${DEPENDENCIES[@]}"
-
-if [[ "$DRY_RUN" -eq 0 ]]; then
-    dpkg-query -W -f='${binary:Package}\n' 2>/dev/null | sort -u > "$AFTER_PACKAGES"
-    comm -13 "$BEFORE_PACKAGES" "$AFTER_PACKAGES" > "$NEW_PACKAGES"
-    mkdir -p "$STATE_DIR"
-    cp "$NEW_PACKAGES" "$STATE_DIR/installed-packages.txt"
-    printf '%s\n' "$INSTALL_DIR" > "$STATE_DIR/install-dir.txt"
-    printf '%s\n' "$SOURCE_DIR" > "$STATE_DIR/source-dir.txt"
-fi
-
-# Stop only the services that are about to be replaced. Existing user data in
-# INSTALL_DIR is left untouched.
-if systemctl list-unit-files "$SERVICE_NAME" >/dev/null 2>&1; then
-    run systemctl stop "$SERVICE_NAME" || true
-fi
-if [[ -n "$OSCAM_BINARY" ]] && systemctl list-unit-files "$OSCAM_SERVICE_NAME" >/dev/null 2>&1; then
-    run systemctl stop "$OSCAM_SERVICE_NAME" || true
-fi
-
-run install -d -m 0755 "$INSTALL_DIR"
-run install -m 0755 "$MAIN_BINARY" "$INSTALL_DIR/$APP_NAME"
-
-if [[ -n "$CA_PLUGIN" ]]; then
-    run install -d -m 0755 "$INSTALL_DIR/ca-plugins"
-    run install -m 0755 "$CA_PLUGIN" "$INSTALL_DIR/ca-plugins/tvstreammersat5-ca-newcamd.so"
-fi
-
-if [[ -n "$OSCAM_BINARY" ]]; then
-    run install -d -m 0755 "$INSTALL_DIR/oscam-mini"
-    run install -m 0755 "$OSCAM_BINARY" "$INSTALL_DIR/oscam-mini/oscam-mini"
-    run install -d -m 0755 "$INSTALL_DIR/oscam-mini/config"
-
-    if [[ -n "$OSCAM_DEFAULT_CONFIG" ]]; then
-        run install -d -m 0755 "$INSTALL_DIR/oscam-mini/default-config"
-        if [[ "$DRY_RUN" -eq 0 ]]; then
-            cp -a "$OSCAM_DEFAULT_CONFIG/." "$INSTALL_DIR/oscam-mini/default-config/"
-            for cfg in oscam.conf oscam.server oscam.user; do
-                if [[ -f "$OSCAM_DEFAULT_CONFIG/$cfg" && ! -e "$INSTALL_DIR/oscam-mini/config/$cfg" ]]; then
-                    cp -a "$OSCAM_DEFAULT_CONFIG/$cfg" "$INSTALL_DIR/oscam-mini/config/$cfg"
-                fi
-            done
-        else
-            echo "+ copy OSCam default-config and seed missing config files"
-        fi
-    fi
-
-    if [[ -n "$OSCAM_SERVICE" ]]; then
-        run install -m 0644 "$OSCAM_SERVICE" "/etc/systemd/system/$OSCAM_SERVICE_NAME"
+if [[ -z "$RESTART" ]]; then
+    if [[ "$MODE" == update ]]; then
+        echo 'Restarting the running service interrupts ALL currently streaming channels.'
+        if ask_yes 'Restart TVStreammerSAT5 after deployment?'; then RESTART=yes; else RESTART=no; fi
     else
-        if [[ "$DRY_RUN" -eq 0 ]]; then
-            cat > "/etc/systemd/system/$OSCAM_SERVICE_NAME" <<EOFUNIT
-[Unit]
-Description=TVStreammerSAT5 OSCam-mini Newcamd/Phoenix server
-After=network.target
-Conflicts=oscam.service
+        if ask_yes 'Start TVStreammerSAT5 after installation?'; then RESTART=yes; else RESTART=no; fi
+    fi
+fi
+if [[ -z "$INSTALL_DEPS" ]]; then
+    if [[ "$MODE" == install ]]; then
+        if ask_yes 'Install required Ubuntu/Debian packages with apt?'; then INSTALL_DEPS=yes; else INSTALL_DEPS=no; fi
+    else INSTALL_DEPS=no; fi
+fi
+[[ "$MODE" == install || "$INSTALL_DEPS" == no ]] || \
+    fail 'Package installation during update is disabled by default; run apt separately if necessary.'
 
-[Service]
-Type=simple
-User=root
-Group=root
-WorkingDirectory=$INSTALL_DIR/oscam-mini
-ExecStart=$INSTALL_DIR/oscam-mini/oscam-mini -c $INSTALL_DIR/oscam-mini/config
-SuccessExitStatus=15 SIGTERM
-Restart=on-failure
-RestartSec=2
-Nice=5
-LimitNOFILE=1024
+active=no
+if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet "$UNIT" 2>/dev/null; then active=yes; fi
+printf '\nOperation       : %s\nSource          : %s\nExecutable      : %s\nweb source      : %s\nMPEG-TS player  : %s\nDestination     : %s\nRunning service : %s\nRestart service : %s\napt dependencies: %s\n' \
+    "$MODE" "$SOURCE_DIR" "$BINARY" "$WEB_DIR" "$MPEGTS_SOURCE" "$INSTALL_DIR" "$active" "$RESTART" "$INSTALL_DEPS"
+[[ -z "$PLUGIN" ]] || printf 'CA plugin       : %s\n' "$PLUGIN"
 
-[Install]
-WantedBy=multi-user.target
-EOFUNIT
-        else
-            echo "+ create /etc/systemd/system/$OSCAM_SERVICE_NAME"
-        fi
+if [[ "$MODE" == update && "$active" == yes && "$RESTART" == no ]]; then
+    echo 'WARNING: Existing process will keep running, but web files become visible immediately.'
+    echo 'Its old HTTP code may be incompatible with the new web assets until you restart it.'
+    if (( ! DRY_RUN )); then
+        ask_yes 'Deploy anyway, without restarting the active service?' || fail 'Cancelled.'
     fi
 fi
 
-# Preserve a customized existing main unit. On a clean host create the standard
-# service expected by the project and by the in-process restart command.
-if [[ ! -f "/etc/systemd/system/$SERVICE_NAME" ]]; then
-    if [[ "$DRY_RUN" -eq 0 ]]; then
-        cat > "/etc/systemd/system/$SERVICE_NAME" <<EOFUNIT
+if (( DRY_RUN )); then
+    echo; echo 'DRY RUN: no packages, files, services or configurations were modified.'
+    exit 0
+fi
+(( EUID == 0 )) || fail 'Run this command with sudo (or as root).'
+command -v systemctl >/dev/null 2>&1 || fail 'systemctl is not available.'
+
+DEPS=(ca-certificates libcurl4-openssl-dev libjsoncpp-dev libssl-dev libcrypt-dev
+      libdvbcsa-dev libboost-thread-dev gstreamer1.0-tools
+      gstreamer1.0-plugins-base gstreamer1.0-plugins-good
+      gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly
+      gstreamer1.0-libav gstreamer1.0-rtsp gstreamer1.0-vaapi
+      vainfo intel-media-va-driver)
+if [[ "$INSTALL_DEPS" == yes ]]; then
+    command -v apt-get >/dev/null 2>&1 || fail 'apt-get is required for installing dependencies.'
+    apt-get update
+    env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${DEPS[@]}"
+fi
+# Check ELF dependencies before deploying or restarting any existing service.
+if command -v ldd >/dev/null 2>&1; then
+    objects=("$BINARY")
+    [[ -z "$PLUGIN" ]] || objects+=("$PLUGIN")
+    for obj in "${objects[@]}"; do
+        missing="$(ldd "$obj" 2>/dev/null | grep 'not found' || true)"
+        [[ -z "$missing" ]] || fail "Missing shared libraries for $obj: $missing"
+    done
+fi
+
+# Prepare full replacement before changing live files. Copy existing web first so
+# vendor files omitted from a release ZIP survive. No channel configuration copied.
+mkdir -p "$INSTALL_DIR"
+STAGE="$(mktemp -d "$INSTALL_DIR/.preview-upgrade.XXXXXXXX")"
+BACKUP_ROOT="$INSTALL_DIR/.installer-backups"
+BACKUP="$BACKUP_ROOT/$(date +%Y%m%d-%H%M%S)-$$"
+mkdir -p "$BACKUP"
+
+BIN_CHANGED=0
+WEB_CHANGED=0
+PLUGIN_CHANGED=0
+OSCAM_CHANGED=0
+DEPLOY_SUCCESS=0
+WAS_ACTIVE="$active"
+cleanup() { [[ -z "${STAGE:-}" || ! -e "$STAGE" ]] || rm -rf -- "$STAGE"; }
+rollback() {
+    local rc="$1"
+    trap - ERR INT TERM
+    echo "ERROR: deployment failed (exit $rc). Attempting to restore overwritten program files." >&2
+    if (( WEB_CHANGED )); then
+        if [[ -d "$BACKUP/web.previous" ]]; then
+            rm -rf -- "$INSTALL_DIR/web"
+            mv -- "$BACKUP/web.previous" "$INSTALL_DIR/web" || true
+        elif [[ -d "$BACKUP/web" ]]; then
+            rm -rf -- "$INSTALL_DIR/web"
+            cp -a -- "$BACKUP/web" "$INSTALL_DIR/web" || true
+        else
+            rm -rf -- "$INSTALL_DIR/web"
+        fi
+    fi
+    if (( BIN_CHANGED )); then
+        if [[ -f "$BACKUP/$APP" ]]; then
+            cp -a -- "$BACKUP/$APP" "$STAGE/$APP.restore" && mv -f -- "$STAGE/$APP.restore" "$INSTALL_DIR/$APP" || true
+        else rm -f -- "$INSTALL_DIR/$APP"; fi
+    fi
+    if (( PLUGIN_CHANGED )); then
+        if [[ -f "$BACKUP/tvstreammersat5-ca-newcamd.so" ]]; then
+            cp -a -- "$BACKUP/tvstreammersat5-ca-newcamd.so" "$INSTALL_DIR/ca-plugins/tvstreammersat5-ca-newcamd.so" || true
+        else rm -f -- "$INSTALL_DIR/ca-plugins/tvstreammersat5-ca-newcamd.so"; fi
+    fi
+    if (( OSCAM_CHANGED )); then
+        if [[ -f "$BACKUP/oscam-mini" ]]; then
+            cp -a -- "$BACKUP/oscam-mini" "$INSTALL_DIR/oscam-mini/oscam-mini" || true
+        else rm -f -- "$INSTALL_DIR/oscam-mini/oscam-mini"; fi
+    fi
+    if [[ "$WAS_ACTIVE" == yes && "$RESTART" == yes ]]; then
+        systemctl restart "$UNIT" || echo "WARNING: original service did not restart; inspect journalctl -u $UNIT" >&2
+    fi
+    cleanup
+    exit "$rc"
+}
+trap 'rollback $?' ERR
+trap 'rollback 130' INT
+trap 'rollback 143' TERM
+trap cleanup EXIT
+
+install -m 0755 "$BINARY" "$STAGE/$APP"
+mkdir -p "$STAGE/web"
+if [[ -d "$INSTALL_DIR/web" ]]; then cp -a -- "$INSTALL_DIR/web/." "$STAGE/web/"; fi
+cp -a -- "$WEB_DIR/." "$STAGE/web/"
+[[ -s "$STAGE/web/vendor/mpegts.min.js" && -s "$STAGE/web/preview/preview-player.js" ]] || \
+    fail 'Staged web content is incomplete.'
+if [[ -n "$PLUGIN" ]]; then
+    install -m 0644 "$PLUGIN" "$STAGE/tvstreammersat5-ca-newcamd.so"
+fi
+if [[ -n "$OSCAM_BINARY" ]]; then
+    install -m 0755 "$OSCAM_BINARY" "$STAGE/oscam-mini"
+fi
+
+# Do not touch production until every asset has been staged and verified.
+if [[ -f "$INSTALL_DIR/$APP" ]]; then cp -a -- "$INSTALL_DIR/$APP" "$BACKUP/$APP"; fi
+if [[ -d "$INSTALL_DIR/web" ]]; then
+    cp -a -- "$INSTALL_DIR/web" "$BACKUP/web"   # persistent rollback copy
+fi
+if [[ -n "$PLUGIN" && -f "$INSTALL_DIR/ca-plugins/tvstreammersat5-ca-newcamd.so" ]]; then
+    cp -a -- "$INSTALL_DIR/ca-plugins/tvstreammersat5-ca-newcamd.so" "$BACKUP/tvstreammersat5-ca-newcamd.so"
+fi
+if [[ -n "$OSCAM_BINARY" && -f "$INSTALL_DIR/oscam-mini/oscam-mini" ]]; then
+    cp -a -- "$INSTALL_DIR/oscam-mini/oscam-mini" "$BACKUP/oscam-mini"
+fi
+
+log 'Deploying executable, complete web/ tree and optional binaries'
+BIN_CHANGED=1
+mv -f -- "$STAGE/$APP" "$INSTALL_DIR/$APP"
+WEB_CHANGED=1
+if [[ -d "$INSTALL_DIR/web" ]]; then
+    mv -- "$INSTALL_DIR/web" "$BACKUP/web.previous"  # fast, same filesystem
+fi
+mv -- "$STAGE/web" "$INSTALL_DIR/web"
+if [[ -n "$PLUGIN" ]]; then
+    install -d -m 0755 "$INSTALL_DIR/ca-plugins"
+    PLUGIN_CHANGED=1
+    mv -f -- "$STAGE/tvstreammersat5-ca-newcamd.so" "$INSTALL_DIR/ca-plugins/tvstreammersat5-ca-newcamd.so"
+fi
+if [[ -n "$OSCAM_BINARY" ]]; then
+    install -d -m 0755 "$INSTALL_DIR/oscam-mini/config"
+    OSCAM_CHANGED=1
+    mv -f -- "$STAGE/oscam-mini" "$INSTALL_DIR/oscam-mini/oscam-mini"
+fi
+
+if [[ "$MODE" == install ]]; then
+    # Preserve any pre-existing customized service file.
+    if ! systemctl list-unit-files "$UNIT" --no-legend 2>/dev/null | grep -q -F "$UNIT"; then
+        install -d -m 0755 /etc/systemd/system
+        cat > "/etc/systemd/system/$UNIT" <<EOFUNIT
 [Unit]
-Description=TVStreammerSAT5 IPTV/DVB streaming server
+Description=TVStreammerSAT5 streaming service
 Wants=network-online.target
 After=network-online.target
 
@@ -287,7 +332,7 @@ Type=simple
 User=root
 Group=root
 WorkingDirectory=$INSTALL_DIR
-ExecStart=$INSTALL_DIR/$APP_NAME
+ExecStart=$INSTALL_DIR/$APP
 Restart=on-failure
 RestartSec=3
 TimeoutStopSec=35
@@ -297,78 +342,27 @@ LimitNOFILE=65536
 WantedBy=multi-user.target
 EOFUNIT
     else
-        echo "+ create /etc/systemd/system/$SERVICE_NAME"
+        echo "Existing $UNIT unit preserved (check ExecStart and WorkingDirectory)."
     fi
+fi
+
+if [[ "$RESTART" == yes ]]; then
+    log 'Restarting TVStreammerSAT5 (this interrupts the channels)'
+    systemctl daemon-reload
+    systemctl enable "$UNIT" >/dev/null
+    systemctl restart "$UNIT"
+    sleep 2
+    systemctl is-active --quiet "$UNIT" || fail 'Service did not become active.'
 else
-    echo "Existing $SERVICE_NAME preserved."
+    echo 'Service left untouched. Restart manually in a maintenance window.'
 fi
-
-run systemctl daemon-reload
-run systemctl enable "$SERVICE_NAME"
-if [[ -n "$OSCAM_BINARY" ]]; then
-    # Avoid two OSCam instances fighting for the same reader/port.
-    if systemctl list-unit-files oscam.service >/dev/null 2>&1; then
-        run systemctl disable --now oscam.service || true
-    fi
-    run systemctl enable "$OSCAM_SERVICE_NAME"
-fi
-
-# Verify dynamic linker dependencies after package installation.
-if [[ "$DRY_RUN" -eq 0 ]]; then
-    MISSING=0
-    for elf in "$INSTALL_DIR/$APP_NAME" \
-               "$INSTALL_DIR/ca-plugins/tvstreammersat5-ca-newcamd.so" \
-               "$INSTALL_DIR/oscam-mini/oscam-mini"; do
-        [[ -f "$elf" ]] || continue
-        if ldd "$elf" 2>/dev/null | grep -q 'not found'; then
-            echo "Missing shared libraries for $elf:" >&2
-            ldd "$elf" | grep 'not found' >&2 || true
-            MISSING=1
-        fi
-    done
-    if [[ "$MISSING" -ne 0 ]]; then
-        echo "Installation stopped before service start because shared libraries are missing." >&2
-        exit 1
-    fi
-
-    REQUIRED_GST_ELEMENTS=(
-        udpsrc udpsink rtpmp2tpay srtsrc srtsink
-        tcpserversink hlssink hlsdemux tsparse tsdemux mpegtsmux
-        avdec_h264 deinterlace videoconvert videoscale watchdog
-    )
-    MISSING_GST=()
-    for element in "${REQUIRED_GST_ELEMENTS[@]}"; do
-        gst-inspect-1.0 "$element" >/dev/null 2>&1 || MISSING_GST+=("$element")
-    done
-    if [[ "${#MISSING_GST[@]}" -gt 0 ]]; then
-        printf 'Warning: missing GStreamer elements: %s\n' "${MISSING_GST[*]}" >&2
-        echo "Some protocols/transcoding functions may be unavailable." >&2
-    fi
-    if gst-inspect-1.0 nvh264enc >/dev/null 2>&1; then
-        echo "NVIDIA NVENC detected: nvh264enc"
-    elif gst-inspect-1.0 x264enc >/dev/null 2>&1; then
-        echo "NVENC is not available; H.264 transcoding will fall back to CPU x264enc."
-    else
-        echo "Warning: neither nvh264enc nor x264enc is available; H.264 transcoding is unavailable." >&2
-    fi
-fi
-
-if [[ "$START_SERVICE" -eq 1 ]]; then
-    if [[ -n "$OSCAM_BINARY" ]]; then
-        run systemctl restart "$OSCAM_SERVICE_NAME"
-    fi
-    run systemctl restart "$SERVICE_NAME"
-fi
-
-if [[ "$DRY_RUN" -eq 0 ]]; then
-    VERSION="$(strings "$INSTALL_DIR/$APP_NAME" 2>/dev/null | grep -E '^202\.[0-9]+$' | tail -1 || true)"
-    echo
-    echo "TVStreammerSAT5 installation complete."
-    echo "Installed binary: $INSTALL_DIR/$APP_NAME"
-    [[ -n "$VERSION" ]] && echo "Detected version : $VERSION"
-    echo "Service status   : systemctl status $SERVICE_NAME --no-pager"
-    echo "Journal          : journalctl -u $SERVICE_NAME -f"
-    echo "Uninstall        : sudo ./uninstall_tvstreammersat5.sh"
-else
-    echo "Dry run complete; no changes were made."
+DEPLOY_SUCCESS=1
+trap - ERR INT TERM
+cleanup
+printf '\nSUCCESS: %s deployed to %s\n' "$MODE" "$INSTALL_DIR"
+printf 'web assets: %s/web (including preview/, vendor/, mpegts.min.js)\n' "$INSTALL_DIR"
+printf 'Rollback backup: %s\n' "$BACKUP"
+printf 'Service status: systemctl status %s --no-pager\n' "$UNIT"
+if [[ "$RESTART" == no ]]; then
+    printf 'Later, when safe: sudo systemctl restart %s\n' "$UNIT"
 fi
