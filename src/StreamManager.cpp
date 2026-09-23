@@ -33,6 +33,7 @@
 #include <sstream>
 #include <functional>
 #include <thread>
+#include <poll.h>
 #include <utility>
 #include <vector>
 
@@ -3643,7 +3644,7 @@ int connectLocalTcpWithRetry(uint16_t port, std::string& error) {
 bool writeAllToFd(int fd, const char* data, size_t size) {
     size_t offset = 0;
     while (offset < size) {
-        ssize_t written = ::write(fd, data + offset, size - offset);
+        ssize_t written = ::send(fd, data + offset, size - offset, MSG_NOSIGNAL);
         if (written < 0) {
             if (errno == EINTR) continue;
             return false;
@@ -7155,12 +7156,11 @@ bool StreamManager::restartStream(const StreamConfig& streamConfig, std::string*
 void StreamManager::stopAll() {
     if (mptsOutputManager) mptsOutputManager->stopAll();
     std::vector<std::unique_ptr<StreamState>> stoppedStreams;
-    std::vector<std::pair<int, int>> httpRelayFds;
     {
         std::lock_guard<std::mutex> lock(managerMutex);
-        httpRelayFds.reserve(httpClients.size());
         for (const auto& [fd, session] : httpClients) {
-            httpRelayFds.emplace_back(fd, session.upstreamFd);
+            ::shutdown(fd, SHUT_RDWR);
+            if (session.upstreamFd >= 0) ::shutdown(session.upstreamFd, SHUT_RDWR);
         }
         httpClients.clear();
         adHocSessions.clear();
@@ -7171,10 +7171,6 @@ void StreamManager::stopAll() {
             stoppedStreams.push_back(std::move(statePtr));
         }
         streams.clear();
-    }
-    for (const auto& [fd, upstreamFd] : httpRelayFds) {
-        if (fd >= 0) ::shutdown(fd, SHUT_RDWR);
-        if (upstreamFd >= 0) ::shutdown(upstreamFd, SHUT_RDWR);
     }
     CardManager::instance().releaseAll();
 
@@ -7515,7 +7511,8 @@ std::string StreamManager::buildPipelineDescription(const StreamConfig& cfg) {
     return desc.str();
 }
 
-bool StreamManager::addHttpClient(const std::string& id, int fd, const std::string& clientIp) {
+bool StreamManager::addHttpClient(const std::string& id, int fd, const std::string& clientIp,
+                                  const std::string& previewSession) {
     uint16_t relayPort = 0;
     std::shared_ptr<std::atomic<uint32_t>> privateDemand;
     {
@@ -7528,6 +7525,15 @@ bool StreamManager::addHttpClient(const std::string& id, int fd, const std::stri
         if (!found->second->active.load() || !found->second->running.load()) {
             ::close(fd);
             return false;
+        }
+        if (!previewSession.empty()) {
+            const auto key = std::make_pair(id, previewSession);
+            const auto cancelled = cancelledPreviewSessions.find(key);
+            if (cancelled != cancelledPreviewSessions.end() &&
+                cancelled->second > std::chrono::steady_clock::now()) {
+                ::close(fd);
+                return false;
+            }
         }
         // Both passthrough and transcoded HTTP now terminate in the same private
         // tcpserversink port.  HttpServer owns the public HTTP socket and relays
@@ -7554,14 +7560,54 @@ bool StreamManager::addHttpClient(const std::string& id, int fd, const std::stri
 
     {
         std::lock_guard<std::mutex> lock(managerMutex);
+        // The close POST may have beaten an in-flight TCP connect.
+        const auto cancelled = cancelledPreviewSessions.find({id, previewSession});
+        const auto found = streams.find(id);
+        if ((!previewSession.empty() && cancelled != cancelledPreviewSessions.end() &&
+             cancelled->second > std::chrono::steady_clock::now()) ||
+            found == streams.end() || !found->second->active.load() ||
+            !found->second->running.load()) {
+            ::close(upstreamFd);
+            ::close(fd);
+            if (privateDemand) privateDemand->fetch_sub(1, std::memory_order_relaxed);
+            return false;
+        }
         httpClients[fd] = {id, normalizeIpAddress(clientIp), "mpegts",
-                           std::chrono::steady_clock::now(), upstreamFd};
+                           std::chrono::steady_clock::now(), upstreamFd, previewSession};
     }
 
     try {
-        std::thread([this, id, fd, upstreamFd, privateDemand]() {
+        std::thread([this, id, fd, upstreamFd, privateDemand, previewSession]() {
             std::array<char, 65536> buffer {};
+            // For preview, watch the browser socket even if the upstream stops
+            // producing data. A blocked read previously delayed teardown by ~1 min.
+            // Existing configured HTTP clients retain the original data path.
+            if (!previewSession.empty()) {
+                const timeval timeout{1, 0};
+                ::setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+            }
             while (true) {
+                if (!previewSession.empty()) {
+                    pollfd sockets[2] = {{upstreamFd, POLLIN, 0}, {fd, POLLIN, 0}};
+                    const int ready = ::poll(sockets, 2, 250);
+                    if (ready < 0) {
+                        if (errno == EINTR) continue;
+                        break;
+                    }
+                    if (ready == 0) continue;
+                    if (sockets[1].revents & (POLLERR | POLLHUP | POLLNVAL)) break;
+                    if (sockets[1].revents & POLLIN) {
+                        char unused;
+                        // A progressive GET never sends more request body data.
+                        // EOF is the browser closing its streaming connection.
+                        // Any bytes from a client after GET are unexpected;
+                        // do not spin on a permanently readable socket.
+                        const ssize_t pending = ::recv(fd, &unused, 1, MSG_PEEK | MSG_DONTWAIT);
+                        if (pending >= 0) break;
+                    }
+                    if (sockets[0].revents & (POLLERR | POLLHUP | POLLNVAL)) break;
+                    if (!(sockets[0].revents & POLLIN)) continue;
+                }
                 ssize_t readBytes = ::read(upstreamFd, buffer.data(), buffer.size());
                 if (readBytes < 0) {
                     if (errno == EINTR) continue;
@@ -7570,58 +7616,86 @@ bool StreamManager::addHttpClient(const std::string& id, int fd, const std::stri
                 if (readBytes == 0) break;
                 if (!writeAllToFd(fd, buffer.data(), static_cast<size_t>(readBytes))) break;
             }
-            ::close(upstreamFd);
-            ::close(fd);
+            // Synchronize close() with explicit shutdown() in closePreviewSession.
+            // Never let an fd be reused while the manager still references it.
+            {
+                std::lock_guard<std::mutex> relayLock(managerMutex);
+                httpClients.erase(fd);
+                ::close(upstreamFd);
+                ::close(fd);
+            }
             if (privateDemand) privateDemand->fetch_sub(1, std::memory_order_relaxed);
-            std::lock_guard<std::mutex> relayLock(managerMutex);
-            httpClients.erase(fd);
         }).detach();
     } catch (const std::exception& ex) {
         if (privateDemand) privateDemand->fetch_sub(1, std::memory_order_relaxed);
         std::cerr << "Resource guard: HTTP relay thread creation failed stream="
                   << id << " error=" << ex.what() << std::endl;
-        ::close(upstreamFd);
-        ::close(fd);
         std::lock_guard<std::mutex> lock(managerMutex);
         httpClients.erase(fd);
+        ::close(upstreamFd);
+        ::close(fd);
         return false;
     }
     return true;
 }
 
+// Explicit, per-viewer teardown. Does not disconnect other previews of this
+// channel or its configured HTTP viewers. The tombstone also cancels a GET
+// which has not completed its upstream connect when the browser closes.
+bool StreamManager::closePreviewSession(const std::string& id, const std::string& previewSession) {
+    if (id.empty() || previewSession.empty()) return false;
+    bool found = false;
+    {
+        std::lock_guard<std::mutex> lock(managerMutex);
+        const auto now = std::chrono::steady_clock::now();
+        for (auto it = cancelledPreviewSessions.begin(); it != cancelledPreviewSessions.end();) {
+            if (it->second <= now) it = cancelledPreviewSessions.erase(it);
+            else ++it;
+        }
+        // Capped even if many short-lived windows are opened in the same minute.
+        while (cancelledPreviewSessions.size() >= 4096)
+            cancelledPreviewSessions.erase(cancelledPreviewSessions.begin());
+        cancelledPreviewSessions[{id, previewSession}] = now + std::chrono::seconds(90);
+        for (const auto& [fd, session] : httpClients) {
+            if (session.streamId != id || session.previewSession != previewSession) continue;
+            // shutdown() wakes an upstream read AND any pending browser write.
+            // Relay worker alone owns close(), under this same mutex.
+            ::shutdown(fd, SHUT_RDWR);
+            if (session.upstreamFd >= 0) ::shutdown(session.upstreamFd, SHUT_RDWR);
+            found = true;
+        }
+    }
+    if (found) {
+        gHttpRelayForcedDisconnects.fetch_add(1, std::memory_order_relaxed);
+        std::cerr << "HTTP PREVIEW CLOSE 203.68: stream=" << id
+                  << " action=shutdown-private-session-and-upstream" << std::endl;
+    }
+    return found;
+}
+
 size_t StreamManager::disconnectHttpRelaySessionsForStream(
     const std::string& streamId, const char* reason) {
     if (streamId.empty()) return 0;
-
-    std::vector<std::pair<int, int>> relayFds;
+    size_t disconnected = 0;
     {
         std::lock_guard<std::mutex> lock(managerMutex);
-        for (auto it = httpClients.begin(); it != httpClients.end();) {
-            if (it->second.streamId != streamId) {
-                ++it;
-                continue;
-            }
-            relayFds.emplace_back(it->first, it->second.upstreamFd);
-            it = httpClients.erase(it);
+        // Relay threads close/erase fds under the same mutex. Do not move raw
+        // fd integers out of the lock: the OS may reuse them before shutdown().
+        for (const auto& [clientFd, session] : httpClients) {
+            if (session.streamId != streamId) continue;
+            ::shutdown(clientFd, SHUT_RDWR);
+            if (session.upstreamFd >= 0) ::shutdown(session.upstreamFd, SHUT_RDWR);
+            ++disconnected;
         }
     }
-
-    // Relay threads own close(). shutdown() is deliberately used here so a
-    // thread blocked on either downstream write or upstream read is awakened
-    // without risking a close/reuse race on the descriptor number.
-    for (const auto& [clientFd, upstreamFd] : relayFds) {
-        if (clientFd >= 0) ::shutdown(clientFd, SHUT_RDWR);
-        if (upstreamFd >= 0) ::shutdown(upstreamFd, SHUT_RDWR);
-    }
-
-    if (!relayFds.empty()) {
-        gHttpRelayForcedDisconnects.fetch_add(relayFds.size(), std::memory_order_relaxed);
-        std::cerr << "HTTP RELAY CLEANUP 202.70: stream=" << streamId
-                  << " sessions=" << relayFds.size()
+    if (disconnected) {
+        gHttpRelayForcedDisconnects.fetch_add(disconnected, std::memory_order_relaxed);
+        std::cerr << "HTTP RELAY CLEANUP 203.68: stream=" << streamId
+                  << " sessions=" << disconnected
                   << " reason=" << (reason ? reason : "unspecified")
                   << " action=shutdown-client-and-upstream" << std::endl;
     }
-    return relayFds.size();
+    return disconnected;
 }
 
 bool StreamManager::addStreamSession(const std::string& streamId, const std::string& clientIp, const std::string& protocol) {

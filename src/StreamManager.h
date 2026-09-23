@@ -303,7 +303,9 @@ public:
     bool isStreamActive(const std::string& id);
     std::vector<std::string> activeStreams();
     std::map<std::string, StreamState*> snapshot();
-    bool addHttpClient(const std::string& id, int fd, const std::string& clientIp);
+    bool addHttpClient(const std::string& id, int fd, const std::string& clientIp,
+                       const std::string& previewSession = {});
+    bool closePreviewSession(const std::string& id, const std::string& previewSession);
     bool addStreamSession(const std::string& streamId, const std::string& clientIp, const std::string& protocol);
     bool removeStreamSession(const std::string& streamId, const std::string& clientIp, const std::string& protocol);
     size_t activeHttpSessions(const std::string& clientIp) const;
@@ -419,8 +421,12 @@ private:
         // owns close(); lifecycle/recovery code only shutdown()s this descriptor
         // to wake a thread blocked on read when the stream pipeline is rebuilt.
         int upstreamFd = -1;
+        std::string previewSession;  // non-empty only for authenticated private preview
     };
     std::map<int, HttpClientSession> httpClients;
+    // Cancel-before-connect guard, expires automatically (also bounds memory).
+    std::map<std::pair<std::string, std::string>, std::chrono::steady_clock::time_point>
+        cancelledPreviewSessions;
     std::map<std::string, HttpClientSession> adHocSessions;
     mutable std::mutex managerMutex;
     // Serialize automatic target updates/config writes coming from independent

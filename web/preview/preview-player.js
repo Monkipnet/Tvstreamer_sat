@@ -39,6 +39,31 @@
     return url.href;
   }
 
+  function newSessionToken() {
+    if (!window.crypto || typeof window.crypto.getRandomValues !== 'function') {
+      throw Error('Браузер не поддерживает безопасный токен HTTP-предпросмотра');
+    }
+    var bytes = new Uint8Array(16);
+    window.crypto.getRandomValues(bytes);
+    return Array.from(bytes, function (value) {
+      return value.toString(16).padStart(2, '0');
+    }).join('');
+  }
+
+  function endServerSession(session) {
+    if (!session) return;
+    // keepalive lets the close request survive tab closing; network errors are
+    // expected on navigation and cannot be handled by blocking the UI.
+    try {
+      var request = fetch('/api/streams/' + encodeURIComponent(session.id) + '/preview/close', {
+        method: 'POST', credentials: 'same-origin', keepalive: true,
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({session: session.token})
+      });
+      if (request && typeof request.catch === 'function') request.catch(function () {});
+    } catch (_) {}
+  }
+
   function element(tag, cls, content) {
     var node = document.createElement(tag);
     if (cls) node.className = cls;
@@ -61,6 +86,7 @@
       });
     };
     var activeTs = null, activeRequest = null, requestSerial = 0;
+    var activeSession = null;
     var modal = null, video = null, status = null, previousFocus = null;
 
     function message(text, error) {
@@ -83,12 +109,16 @@
     function close() {
       requestSerial++;
       if (activeRequest) { activeRequest.abort(); activeRequest = null; }
+      var closing = activeSession;
+      activeSession = null;
+      // Closing one tile must never terminate another viewer's HTTP session.
+      endServerSession(closing);
       resetMedia();
       if (modal) { modal.remove(); modal = null; }
       video = status = null;
       if (previousFocus && typeof previousFocus.focus === 'function') previousFocus.focus();
     }
-    function playHttp(payload) {
+    function playHttp(payload, streamId) {
       if (payload && payload.active === false) {
         message('Поток остановлен: временный HTTP-предпросмотр недоступен.', true);
         return;
@@ -99,8 +129,17 @@
         return;
       }
       var url;
-      try { url = safeBrowserUrl(source.url, window.location.href, options.allowCrossOrigin === true); }
-      catch (error) { message(error.message, true); return; }
+      try {
+        url = safeBrowserUrl(source.url, window.location.href, options.allowCrossOrigin === true);
+        var previewPath = '/api/streams/' + encodeURIComponent(streamId) + '/preview.ts';
+        var parsed = new URL(url);
+        if (parsed.origin === window.location.origin && parsed.pathname === previewPath) {
+          var token = newSessionToken();
+          parsed.searchParams.set('session', token);
+          url = parsed.href;
+          activeSession = {id: streamId, token: token};
+        }
+      } catch (error) { message(error.message, true); return; }
       if (!window.mpegts || !window.mpegts.getFeatureList ||
           !window.mpegts.getFeatureList().mseLivePlayback) {
         message('Для HTTP MPEG-TS необходимы локальная mpegts.js и поддержка MediaSource.', true);
@@ -158,7 +197,7 @@
         .then(function (payload) {
           if (serial !== requestSerial || !modal) return;
           activeRequest = null;
-          playHttp(payload);
+          playHttp(payload, streamId);
         }).catch(function (error) {
           if (serial !== requestSerial || !modal || error.name === 'AbortError') return;
           activeRequest = null;
@@ -177,10 +216,13 @@
     function onKeyDown(event) { if (event.key === 'Escape' && modal) { event.preventDefault(); close(); } }
     document.addEventListener('dblclick', onDblClick, true);
     document.addEventListener('keydown', onKeyDown, true);
+    // Handles tab navigation, not only the modal close button / Escape.
+    window.addEventListener('pagehide', close);
     return {open: open, close: close, destroy: function () {
       close();
       document.removeEventListener('dblclick', onDblClick, true);
       document.removeEventListener('keydown', onKeyDown, true);
+      window.removeEventListener('pagehide', close);
     }};
   }
   return {install: install, chooseHttpSource: chooseHttpSource, safeBrowserUrl: safeBrowserUrl};
