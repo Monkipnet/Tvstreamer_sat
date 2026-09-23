@@ -6790,6 +6790,10 @@ window.addEventListener('beforeunload', () => {
   }
   return {install: install, chooseHttpSource: chooseHttpSource, safeBrowserUrl: safeBrowserUrl};
 });
+// Register one delegated double-click handler. Tiles are rendered asynchronously.
+window.tvstreammerPreviewController = window.TVStreammerPreview.install({
+  tileSelector: '.tile[data-stream-id]'
+});
 </script>
 </body>
 </html>
