@@ -7614,7 +7614,19 @@ bool StreamManager::addHttpClient(const std::string& id, int fd, const std::stri
                 const timeval timeout{1, 0};
                 ::setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
             }
+            const auto started = std::chrono::steady_clock::now();
+            bool previewFirstByteLogged = false;
+            bool previewNoDataLogged = false;
+            uint64_t previewBytes = 0;
             while (true) {
+                if (!previewSession.empty() && !previewFirstByteLogged &&
+                    !previewNoDataLogged &&
+                    std::chrono::steady_clock::now() - started >= std::chrono::seconds(10)) {
+                    previewNoDataLogged = true;
+                    std::cerr << "HTTP PREVIEW DELIVERY 203.73: stream=" << id
+                              << " event=no-upstream-media-after-10s bytes=0"
+                              << " action=diagnose-private-branch" << std::endl;
+                }
                 if (!previewSession.empty()) {
                     pollfd sockets[2] = {{upstreamFd, POLLIN, 0}, {fd, POLLIN, 0}};
                     const int ready = ::poll(sockets, 2, 250);
@@ -7643,6 +7655,24 @@ bool StreamManager::addHttpClient(const std::string& id, int fd, const std::stri
                 }
                 if (readBytes == 0) break;
                 if (!writeAllToFd(fd, buffer.data(), static_cast<size_t>(readBytes))) break;
+                if (!previewSession.empty()) {
+                    previewBytes += static_cast<uint64_t>(readBytes);
+                    if (!previewFirstByteLogged) {
+                        previewFirstByteLogged = true;
+                        const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::steady_clock::now() - started).count();
+                        std::cerr << "HTTP PREVIEW DELIVERY 203.73: stream=" << id
+                                  << " event=first-upstream-bytes elapsed_ms=" << elapsed
+                                  << " bytes=" << readBytes << std::endl;
+                    }
+                }
+            }
+            if (!previewSession.empty()) {
+                const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - started).count();
+                std::cerr << "HTTP PREVIEW DELIVERY 203.73: stream=" << id
+                          << " event=relay-finished elapsed_ms=" << elapsed
+                          << " bytes_to_browser=" << previewBytes << std::endl;
             }
             // Synchronize close() with explicit shutdown() in closePreviewSession.
             // Never let an fd be reused while the manager still references it.
@@ -9329,6 +9359,44 @@ bool StreamManager::buildOutputBranch(
     }
     if (type == "hls") {
         return buildHlsOutputPipeline(state, pipeline, sourceTail, outputConfig, branchIndex);
+    }
+
+    // 203.73: The private DVB preview must relay the ALREADY SELECTED SPTS.
+    // Sending it through the generic HTTP tsdemux/mpegtsmux branch can stall
+    // for DVB/private/unsupported elementary streams although the original
+    // UDP/SRT channel is perfectly healthy. The preview path must never
+    // select a different service, rewrite PIDs or hold the production tee.
+    // Only use this fast path for the synthetic localhost-only preview, and
+    // only when DVB service selection has already produced an SPTS. A public
+    // HTTP output retains its existing NETUP compatibility remux.
+    const bool privateDvbPreview = type == "http" &&
+        outputConfig.outputHost == "127.0.0.1" && outputConfig.outputPort == 0 &&
+        state && !state->config.transcodeEnabled &&
+        ((state->sharedDvbInput && !state->sharedDvbServiceRelayUri.empty() &&
+          state->runtimeConfig.inputUri == state->sharedDvbServiceRelayUri) ||
+         (tvs::stream_protocols::isDvbInput(
+              tvs::stream_protocols::inputKind(state->runtimeConfig)) &&
+          state->runtimeConfig.inputServiceId > 0));
+    if (privateDvbPreview) {
+        GstElement* queue = gst_element_factory_make(
+            "queue", branchName("private_dvb_preview_queue", branchIndex).c_str());
+        GstElement* sink = createOutputSink(
+            state, outputConfig, pipeline,
+            branchName("private_dvb_preview_sink", branchIndex));
+        if (!queue || !sink || !addElementOrFail(pipeline, queue)) {
+            if (queue && !GST_OBJECT_PARENT(queue)) gst_object_unref(queue);
+            return false;
+        }
+        // The upstream branch already has an independent 1 s leaky tee queue.
+        // A second bounded leaky queue prevents a slow web viewer from holding
+        // this channel's primary output while keeping TS packets intact.
+        configureLiveQueue(queue, 1000000000ULL);
+        const bool linked = gst_element_link_many(sourceTail, queue, sink, nullptr);
+        std::cerr << "SAT PREVIEW 203.73: stream=" << state->config.id
+                  << " transport=selected-SPTS-direct remux=off"
+                  << " service_reselection=off video_transcode=off"
+                  << " result=" << (linked ? "ready" : "link-failed") << std::endl;
+        return linked;
     }
 
     // A transcoded stream is already a finished single-program MPEG-TS produced by
