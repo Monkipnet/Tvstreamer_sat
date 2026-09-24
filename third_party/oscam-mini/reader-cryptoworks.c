@@ -7,8 +7,8 @@
 
 struct cryptoworks_data
 {
-	BIGNUM          exp;
-	BIGNUM          ucpk;
+	BIGNUM          *exp;
+	BIGNUM          *ucpk;
 	int32_t         ucpk_valid;
 };
 
@@ -219,6 +219,17 @@ static int32_t cryptoworks_disable_pin(struct s_reader *reader)
 	return OK;
 }
 
+static void cryptoworks_card_done(struct s_reader *reader)
+{
+	struct cryptoworks_data *data = reader->csystem_data;
+	if(!data) { return; }
+	BN_clear_free(data->exp);
+	BN_clear_free(data->ucpk);
+	data->exp = NULL;
+	data->ucpk = NULL;
+	data->ucpk_valid = 0;
+}
+
 static int32_t cryptoworks_card_init(struct s_reader *reader, ATR *newatr)
 {
 	get_atr;
@@ -237,6 +248,13 @@ static int32_t cryptoworks_card_init(struct s_reader *reader, ATR *newatr)
 	if(!cs_malloc(&reader->csystem_data, sizeof(struct cryptoworks_data)))
 		{ return ERROR; }
 	struct cryptoworks_data *csystem_data = reader->csystem_data;
+	csystem_data->exp = BN_new();
+	csystem_data->ucpk = BN_new();
+	if(!csystem_data->exp || !csystem_data->ucpk)
+	{
+		rdr_log(reader, "failed to allocate CryptoWorks big numbers");
+		return ERROR; // caller invokes card_done before freeing csystem_data
+	}
 
 	rdr_log(reader, "card detected");
 	rdr_log(reader, "type: CryptoWorks");
@@ -281,15 +299,19 @@ static int32_t cryptoworks_card_init(struct s_reader *reader, ATR *newatr)
 		if(search_boxkey(reader, reader->caid, (char *)keybuf))
 		{
 			ipk = BN_new();
-			BN_bin2bn(cwexp, sizeof(cwexp), &csystem_data->exp);
-			BN_bin2bn(keybuf, 64, ipk);
-			cw_RSA(reader, cta_res + 2, cta_res + 2, 0x40, &csystem_data->exp, ipk, 0);
+			if(!ipk || !BN_bin2bn(cwexp, sizeof(cwexp), csystem_data->exp)
+					|| !BN_bin2bn(keybuf, 64, ipk))
+			{
+				BN_clear_free(ipk);
+				return ERROR;
+			}
+			cw_RSA(reader, cta_res + 2, cta_res + 2, 0x40, csystem_data->exp, ipk, 0);
 			BN_free(ipk);
 			csystem_data->ucpk_valid = (cta_res[2] == ((mfid & 0xFF) >> 1));
 			if(csystem_data->ucpk_valid)
 			{
 				cta_res[2] |= 0x80;
-				BN_bin2bn(cta_res + 2, 0x40, &csystem_data->ucpk);
+				BN_bin2bn(cta_res + 2, 0x40, csystem_data->ucpk);
 				rdr_log_dump_dbg(reader, D_READER, cta_res + 2, 0x40, "IPK available -> session-key:");
 			}
 			else
@@ -297,7 +319,7 @@ static int32_t cryptoworks_card_init(struct s_reader *reader, ATR *newatr)
 				csystem_data->ucpk_valid = (keybuf[0] == (((mfid & 0xFF) >> 1) | 0x80));
 				if(csystem_data->ucpk_valid)
 				{
-					BN_bin2bn(keybuf, 0x40, &csystem_data->ucpk);
+					BN_bin2bn(keybuf, 0x40, csystem_data->ucpk);
 					rdr_log_dump_dbg(reader, D_READER, keybuf, 0x40, "session-key found:");
 				}
 				else
@@ -399,7 +421,7 @@ static int32_t cryptoworks_do_ecm(struct s_reader *reader, const ECM_REQUEST *er
 					{
 						if(csystem_data->ucpk_valid)
 						{
-							cw_RSA(reader, &cta_res[i + 2], &cta_res[i + 2], n, &csystem_data->exp, &csystem_data->ucpk, 0);
+							cw_RSA(reader, &cta_res[i + 2], &cta_res[i + 2], n, csystem_data->exp, csystem_data->ucpk, 0);
 							rdr_log_dbg(reader, D_READER, "after camcrypt");
 							r = 0;
 							secLen = n - 4;
@@ -866,6 +888,7 @@ const struct s_cardsystem reader_cryptoworks =
 	.do_ecm            = cryptoworks_do_ecm,
 	.card_info         = cryptoworks_card_info,
 	.card_init         = cryptoworks_card_init,
+	.card_done         = cryptoworks_card_done,
 	.get_emm_type      = cryptoworks_get_emm_type,
 	.get_emm_filter    = cryptoworks_get_emm_filter,
 };
