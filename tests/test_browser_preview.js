@@ -20,6 +20,8 @@ const temporary = {sources: [
 assert.deepEqual(preview.chooseHttpSource(configured), {label: 'HTTP MPEG-TS', url: '/stream/stream-1.ts'});
 assert.deepEqual(preview.chooseHttpSource(temporary), {label: 'Временный HTTP MPEG-TS', url: '/api/streams/stream-2/preview.ts'});
 assert.equal(preview.chooseHttpSource({sources: [{kind: 'hls', preview_kind: 'hls', preview_url: '/hls/x/video.m3u8'}]}), null);
+assert.deepEqual(preview.chooseHlsSource({sources: [{kind: 'hls', preview_kind: 'hls', preview_url: '/hls/x/video.m3u8'}]}), {label:'HLS', url:'/hls/x/video.m3u8'});
+assert.equal(preview.chooseHlsSource({sources: [{kind: 'http', preview_kind: 'mpegts', preview_url: '/stream/x.ts'}]}), null);
 assert.equal(preview.safeBrowserUrl('/api/streams/stream-2/preview.ts', 'https://host:8880/'), 'https://host:8880/api/streams/stream-2/preview.ts');
 assert.throws(() => preview.safeBrowserUrl('srt://host:1234', 'https://host:8880/'), /HTTP/);
 assert.throws(() => preview.safeBrowserUrl('http://other/stream.ts', 'http://host/'), /same-origin/);
@@ -30,8 +32,8 @@ assert.ok(cpp.includes('resolvePrivatePreviewTarget'));
 assert.ok(cpp.includes('"/api/streams/" + cleanId + "/preview.ts"'));
 assert.ok(cpp.includes('if (target.rfind("/api/streams/", 0) == 0) return true;'));
 assert.ok(cpp.includes('<script src="/preview/mpegts.min.js" defer></script>'));
-assert.ok(!cpp.includes('<script src="/preview/hls.min.js" defer></script>'));
-assert.ok(!js.includes('new window.Hls('));
+assert.ok(cpp.includes('<script src="/preview/hls.min.js" defer></script>'));
+assert.ok(js.includes('new window.Hls('));
 assert.ok(!js.includes('tvp-choices'));
 assert.ok(!css.includes('.tvp-choice'));
 

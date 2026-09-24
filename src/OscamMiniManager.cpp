@@ -478,8 +478,19 @@ bool OscamMiniManager::saveLocked(const Settings& settings, std::string& error) 
             error = "У ридера отсутствует имя";
             return false;
         }
-        if (reader.device.rfind("/dev/", 0) != 0) {
-            error = "Некорректное устройство ридера " + reader.label;
+        const bool pcsc = reader.protocol == "pcsc";
+        const bool serialDevice = reader.device.rfind("/dev/", 0) == 0 &&
+            reader.device.size() > 5 && reader.device.size() <= 256 &&
+            reader.device.find_first_of("\r\n;#") == std::string::npos;
+        // OSCam's PC/SC backend selects a zero-based index from SCardListReaders.
+        // Never pass an OMNIKEY device path or arbitrary text as a PC/SC index.
+        const bool pcscIndex = !reader.device.empty() && reader.device.size() <= 3 &&
+            std::all_of(reader.device.begin(), reader.device.end(), [](unsigned char c) {
+                return std::isdigit(c) != 0;
+            }) && std::stoul(reader.device) <= 999;
+        if ((pcsc && !pcscIndex) || (!pcsc && !serialDevice)) {
+            error = pcsc ? "Для PC/SC укажите индекс ридера (0, 1, ...): " + reader.label
+                         : "Некорректное устройство ридера " + reader.label;
             return false;
         }
         if (!isHex(reader.caid, 4)) {
@@ -494,8 +505,9 @@ bool OscamMiniManager::saveLocked(const Settings& settings, std::string& error) 
             error = "Некорректная частота ридера " + reader.label;
             return false;
         }
-        if (reader.protocol != "mouse" && reader.protocol != "phoenix") {
-            error = "Поддерживаются только mouse/phoenix: " + reader.label;
+        if (reader.protocol != "mouse" && reader.protocol != "phoenix" &&
+            reader.protocol != "pcsc") {
+            error = "Поддерживаются mouse/phoenix/pcsc: " + reader.label;
             return false;
         }
         if (!reader.boxkey.empty() && !isHex(reader.boxkey, 16)) {
@@ -522,10 +534,14 @@ bool OscamMiniManager::saveLocked(const Settings& settings, std::string& error) 
         if (!reader.rsakey.empty()) {
             server << "rsakey = " << safeIni(reader.rsakey) << "\n";
         }
-        server << "detect = " << safeIni(reader.detect) << "\n"
-               << "mhz = " << reader.mhz << "\n"
-               << "cardmhz = " << reader.cardmhz << "\n"
-               << "group = " << reader.group << "\n";
+        server << "detect = " << (pcsc ? "none" : safeIni(reader.detect)) << "\n";
+        // PC/SC negotiates clock and card parameters through pcscd.  Phoenix
+        // settings must not be imposed on USB OMNIKEY readers.
+        if (!pcsc) {
+            server << "mhz = " << reader.mhz << "\n"
+                   << "cardmhz = " << reader.cardmhz << "\n";
+        }
+        server << "group = " << reader.group << "\n";
         if (!reader.ident.empty()) {
             server << "ident = " << safeIni(reader.ident) << "\n";
         }
@@ -858,7 +874,7 @@ function userHtml(u={},i=0){const name=u.user||('user'+(i+1));return `<div class
 </div><div class="row" style="margin-top:10px"><label style="flex-direction:row;align-items:center"><input class="user-au" type="checkbox" ${u.au!==false?'checked':''}> AU/EMM</label><button class="danger" onclick="this.closest('.user').remove()">Удалить пользователя</button></div></div></div>`}
 function addUser(u={}){const box=document.createElement('div');box.innerHTML=userHtml(u,document.querySelectorAll('.user').length);users.append(...box.childNodes);applyActivity(lastStatus)}
 
-function readerHtml(r={},i=0){const label=r.label||('Reader'+(i+1));const opts=['',...devices];if(r.device&&!opts.includes(r.device))opts.push(r.device);const options=opts.map(d=>`<option value="${esc(d)}" ${d===r.device?'selected':''}>${esc(d)}</option>`).join('');return `<div class="compact-item reader" data-reader="${esc(label)}">
+function readerHtml(r={},i=0){const label=r.label||('Reader'+(i+1));return `<div class="compact-item reader" data-reader="${esc(label)}">
 <button type="button" class="compact-head" onclick="toggleItem(this)">
 <span class="activity-dot">${activityDot('down')}</span>
 <span class="compact-main reader-summary-label">${esc(label)}</span>
@@ -869,10 +885,10 @@ function readerHtml(r={},i=0){const label=r.label||('Reader'+(i+1));const opts=[
 </button>
 <div class="compact-body"><div class="g">
 <label>Имя<input class="reader-label" value="${esc(label)}"></label>
-<label>Устройство<select class="reader-device">${options}</select></label>
+<label>Устройство / индекс PC/SC<input class="reader-device" value="${esc(r.device||'')}" placeholder="/dev/ttyUSB0 или 0"></label>
 <label>CAID<input class="reader-caid" maxlength="4" value="${esc(r.caid||'0652')}"></label>
-<label>Протокол<select class="reader-protocol"><option value="mouse" ${r.protocol==='mouse'?'selected':''}>mouse</option><option value="phoenix" ${r.protocol==='phoenix'?'selected':''}>phoenix</option></select></label>
-<label>MHz<input class="reader-mhz" type="number" value="${esc(r.mhz||600)}"></label>
+<label>Протокол<select class="reader-protocol"><option value="mouse" ${r.protocol==='mouse'?'selected':''}>mouse</option><option value="phoenix" ${r.protocol==='phoenix'?'selected':''}>phoenix</option><option value="pcsc" ${r.protocol==='pcsc'?'selected':''}>PC/SC (OMNIKEY)</option></select></label>
+<label>MHz (Phoenix)<input class="reader-mhz" type="number" value="${esc(r.mhz||600)}"></label>
 <label>Card MHz<input class="reader-cardmhz" type="number" value="${esc(r.cardmhz||600)}"></label>
 <label>Group<input class="reader-group" type="number" min="1" max="64" value="${esc(r.group||1)}"></label>
 <label>Ident<input class="reader-ident" value="${esc(r.ident||'')}"></label>

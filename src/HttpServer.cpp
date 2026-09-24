@@ -159,7 +159,7 @@ std::string cleanPathToken(const std::string& value, bool allowDot = false) {
 // Browser-only libraries are kept on disk next to the program, not loaded from CDN.
 // No preview code is executed until an authenticated administrator opens a tile.
 std::string readPreviewVendorLibrary(const std::string& fileName) {
-    if (fileName != "mpegts.min.js") return {};
+    if (fileName != "mpegts.min.js" && fileName != "hls.min.js") return {};
     std::error_code ec;
     const std::filesystem::path exe = std::filesystem::read_symlink("/proc/self/exe", ec);
     if (ec || exe.empty()) return {};
@@ -878,7 +878,8 @@ void HttpServer::handleSession(tcp::socket socket) {
             } else if (target == "/api/oscam-mini/settings") {
                 res.set(http::field::content_type, "application/json");
                 res.body() = OscamMiniManager::instance().settingsJson();
-            } else if (target == "/preview/mpegts.min.js") {
+            } else if (target == "/preview/mpegts.min.js" ||
+                       target == "/preview/hls.min.js") {
                 const std::string name = target.substr(std::string("/preview/").size());
                 std::string script = readPreviewVendorLibrary(name);
                 if (script.empty()) {
@@ -909,6 +910,9 @@ void HttpServer::handleSession(tcp::socket socket) {
                     manifest["name"] = cfg->name;
                     const bool active = streamManager.isStreamActive(cfg->id);
                     manifest["active"] = active;
+                    manifest["input_mode"] = cfg->inputMode;
+                    manifest["input_is_hls"] = toLower(cfg->inputMode) == "hls" ||
+                        toLower(cfg->inputUri).find(".m3u8") != std::string::npos;
                     Json::Value sources(Json::arrayValue);
                     // A browser preview uses the existing HTTP relay when present,
                     // otherwise an isolated private MPEG-TS relay sharing this
@@ -927,6 +931,18 @@ void HttpServer::handleSession(tcp::socket socket) {
                             ? "/stream/" + cleanId + ".ts"
                             : "/api/streams/" + cleanId + "/preview.ts";
                         sources.append(std::move(source));
+                        // If this channel also publishes HLS, offer the already
+                        // running playlist as an alternate browser transport.
+                        // No upstream URL, access token or satellite URI leaks.
+                        if (hasOutputType(*cfg, "hls")) {
+                            Json::Value hls(Json::objectValue);
+                            hls["id"] = "configured-hls";
+                            hls["label"] = "HLS";
+                            hls["kind"] = "hls";
+                            hls["preview_kind"] = "hls";
+                            hls["preview_url"] = "/" + hlsPublicName(*cfg) + "/video.m3u8";
+                            sources.append(std::move(hls));
+                        }
                     }
                     manifest["sources"] = std::move(sources);
                     Json::StreamWriterBuilder writer;
@@ -3646,6 +3662,7 @@ header{position:fixed;top:0;left:0;right:0;z-index:100000;overflow:visible;displ
 <div class="modal-content" id="modalContent"></div>
 </div>
 <script src="/preview/mpegts.min.js" defer></script>
+<script src="/preview/hls.min.js" defer></script>
 <script>
 const translations = {
   en: {
@@ -6588,6 +6605,18 @@ window.addEventListener('beforeunload', () => {
     };
   }
 
+  function chooseHlsSource(payload) {
+    var sources = Array.isArray(payload) ? payload : payload && payload.sources;
+    if (!Array.isArray(sources)) return null;
+    var source = sources.find(function (s) {
+      return s && String(s.kind || s.type || '').toLowerCase() === 'hls' &&
+        String(s.preview_kind || s.previewKind || '').toLowerCase() === 'hls' &&
+        typeof (s.preview_url || s.previewUrl) === 'string' &&
+        Boolean((s.preview_url || s.previewUrl).trim());
+    });
+    return source ? {label: String(source.label || 'HLS'), url: source.preview_url.trim()} : null;
+  }
+
   function safeBrowserUrl(raw, base, allowCrossOrigin) {
     if (!raw) return null;
     var url;
@@ -6648,7 +6677,7 @@ window.addEventListener('beforeunload', () => {
         return response.json();
       });
     };
-    var activeTs = null, activeRequest = null, requestSerial = 0;
+    var activeTs = null, activeHls = null, activeRequest = null, requestSerial = 0;
     var activeSession = null;
     var modal = null, video = null, status = null, previousFocus = null;
 
@@ -6658,6 +6687,11 @@ window.addEventListener('beforeunload', () => {
       status.className = 'tvp-status' + (error ? ' tvp-error' : '');
     }
     function resetMedia() {
+      if (activeHls) {
+        var oldHls = activeHls;
+        activeHls = null;
+        try { oldHls.destroy(); } catch (_) {}
+      }
       if (activeTs) {
         var player = activeTs;
         activeTs = null;
@@ -6681,12 +6715,50 @@ window.addEventListener('beforeunload', () => {
       video = status = null;
       if (previousFocus && typeof previousFocus.focus === 'function') previousFocus.focus();
     }
+    function playHls(source) {
+      var url;
+      try { url = safeBrowserUrl(source.url, window.location.href, options.allowCrossOrigin === true); }
+      catch (error) { message(error.message, true); return; }
+      try {
+        video.muted = true;
+        if (video.canPlayType('application/vnd.apple.mpegurl')) {
+          video.src = url;
+        } else if (window.Hls && typeof window.Hls.isSupported === 'function' &&
+                   window.Hls.isSupported()) {
+          var player = new window.Hls({enableWorker: false, lowLatencyMode: true});
+          activeHls = player;
+          player.on(window.Hls.Events.ERROR, function (_event, data) {
+            if (activeHls === player && data && data.fatal) {
+              message('Ошибка HLS: ' + String(data.details || data.type || 'нет данных'), true);
+            }
+          });
+          player.attachMedia(video);
+          player.loadSource(url);
+        } else {
+          message('Для HLS необходима поддержка браузера или локальная hls.js.', true);
+          return;
+        }
+        message('HLS · ' + source.label + ' · звук включается в плеере');
+        Promise.resolve(video.play()).catch(function () { message('Нажмите ▶ для запуска видео.'); });
+      } catch (error) { resetMedia(); message('Ошибка HLS: ' + error.message, true); }
+    }
+
     function playHttp(payload, streamId) {
       if (payload && payload.active === false) {
         message('Поток остановлен: временный HTTP-предпросмотр недоступен.', true);
         return;
       }
+      var hls = chooseHlsSource(payload);
+      // Input HLS may contain TS discontinuities that are handled by the
+      // existing playlist; prefer it if a compatible browser player exists.
+      var inputMode = String(payload && payload.input_mode || '').toLowerCase();
+      var isHlsInput = (payload && payload.input_is_hls === true) || inputMode === 'hls';
+      var canHls = (typeof video.canPlayType === 'function' &&
+        video.canPlayType('application/vnd.apple.mpegurl')) ||
+        (window.Hls && typeof window.Hls.isSupported === 'function' && window.Hls.isSupported());
+      if (hls && canHls && isHlsInput) { playHls(hls); return; }
       var source = chooseHttpSource(payload);
+      if (!source && hls && canHls) { playHls(hls); return; }
       if (!source) {
         message('Временный HTTP-предпросмотр недоступен для этого канала.', true);
         return;
@@ -6714,11 +6786,22 @@ window.addEventListener('beforeunload', () => {
           {enableWorker: false, lazyLoad: false, liveBufferLatencyChasing: false});
         activeTs = player;
         player.on(window.mpegts.Events.ERROR, function (_type, detail) {
-          if (activeTs === player) message('Ошибка HTTP MPEG-TS: ' + String(detail || 'нет данных'), true);
+          if (activeTs !== player) return;
+          // If an already-configured HLS output exists (including satellite
+          // channels), try its browser player before declaring preview failed.
+          // No new source, encoder or public endpoint is created here.
+          if (hls && canHls) {
+            resetMedia();
+            playHls(hls);
+          } else {
+            message('Ошибка HTTP MPEG-TS: ' + String(detail || 'нет данных') +
+              '. Проверьте кодеки канала и доступность новых видеокадров.', true);
+          }
         });
         player.attachMediaElement(video);
         player.load();
-        message('HTTP MPEG-TS · ' + source.label + ' · звук включается в плеере');
+        message('HTTP MPEG-TS · ' + source.label + ' · звук включается в плеере. ' +
+          'Для спутникового MPEG-2/AC3 браузеру может потребоваться H.264/AAC-превью.');
         Promise.resolve(player.play()).catch(function () {
           if (activeTs === player) message('Нажмите ▶ для запуска видео.');
         });
@@ -6788,7 +6871,8 @@ window.addEventListener('beforeunload', () => {
       window.removeEventListener('pagehide', close);
     }};
   }
-  return {install: install, chooseHttpSource: chooseHttpSource, safeBrowserUrl: safeBrowserUrl};
+  return {install: install, chooseHttpSource: chooseHttpSource,
+    chooseHlsSource: chooseHlsSource, safeBrowserUrl: safeBrowserUrl};
 });
 // Register one delegated double-click handler. Tiles are rendered asynchronously.
 window.tvstreammerPreviewController = window.TVStreammerPreview.install({

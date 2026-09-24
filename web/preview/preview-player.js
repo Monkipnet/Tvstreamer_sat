@@ -25,6 +25,18 @@
     };
   }
 
+  function chooseHlsSource(payload) {
+    var sources = Array.isArray(payload) ? payload : payload && payload.sources;
+    if (!Array.isArray(sources)) return null;
+    var source = sources.find(function (s) {
+      return s && String(s.kind || s.type || '').toLowerCase() === 'hls' &&
+        String(s.preview_kind || s.previewKind || '').toLowerCase() === 'hls' &&
+        typeof (s.preview_url || s.previewUrl) === 'string' &&
+        Boolean((s.preview_url || s.previewUrl).trim());
+    });
+    return source ? {label: String(source.label || 'HLS'), url: source.preview_url.trim()} : null;
+  }
+
   function safeBrowserUrl(raw, base, allowCrossOrigin) {
     if (!raw) return null;
     var url;
@@ -85,7 +97,7 @@
         return response.json();
       });
     };
-    var activeTs = null, activeRequest = null, requestSerial = 0;
+    var activeTs = null, activeHls = null, activeRequest = null, requestSerial = 0;
     var activeSession = null;
     var modal = null, video = null, status = null, previousFocus = null;
 
@@ -95,6 +107,11 @@
       status.className = 'tvp-status' + (error ? ' tvp-error' : '');
     }
     function resetMedia() {
+      if (activeHls) {
+        var oldHls = activeHls;
+        activeHls = null;
+        try { oldHls.destroy(); } catch (_) {}
+      }
       if (activeTs) {
         var player = activeTs;
         activeTs = null;
@@ -118,12 +135,50 @@
       video = status = null;
       if (previousFocus && typeof previousFocus.focus === 'function') previousFocus.focus();
     }
+    function playHls(source) {
+      var url;
+      try { url = safeBrowserUrl(source.url, window.location.href, options.allowCrossOrigin === true); }
+      catch (error) { message(error.message, true); return; }
+      try {
+        video.muted = true;
+        if (video.canPlayType('application/vnd.apple.mpegurl')) {
+          video.src = url;
+        } else if (window.Hls && typeof window.Hls.isSupported === 'function' &&
+                   window.Hls.isSupported()) {
+          var player = new window.Hls({enableWorker: false, lowLatencyMode: true});
+          activeHls = player;
+          player.on(window.Hls.Events.ERROR, function (_event, data) {
+            if (activeHls === player && data && data.fatal) {
+              message('Ошибка HLS: ' + String(data.details || data.type || 'нет данных'), true);
+            }
+          });
+          player.attachMedia(video);
+          player.loadSource(url);
+        } else {
+          message('Для HLS необходима поддержка браузера или локальная hls.js.', true);
+          return;
+        }
+        message('HLS · ' + source.label + ' · звук включается в плеере');
+        Promise.resolve(video.play()).catch(function () { message('Нажмите ▶ для запуска видео.'); });
+      } catch (error) { resetMedia(); message('Ошибка HLS: ' + error.message, true); }
+    }
+
     function playHttp(payload, streamId) {
       if (payload && payload.active === false) {
         message('Поток остановлен: временный HTTP-предпросмотр недоступен.', true);
         return;
       }
+      var hls = chooseHlsSource(payload);
+      // Input HLS may contain TS discontinuities that are handled by the
+      // existing playlist; prefer it if a compatible browser player exists.
+      var inputMode = String(payload && payload.input_mode || '').toLowerCase();
+      var isHlsInput = (payload && payload.input_is_hls === true) || inputMode === 'hls';
+      var canHls = (typeof video.canPlayType === 'function' &&
+        video.canPlayType('application/vnd.apple.mpegurl')) ||
+        (window.Hls && typeof window.Hls.isSupported === 'function' && window.Hls.isSupported());
+      if (hls && canHls && isHlsInput) { playHls(hls); return; }
       var source = chooseHttpSource(payload);
+      if (!source && hls && canHls) { playHls(hls); return; }
       if (!source) {
         message('Временный HTTP-предпросмотр недоступен для этого канала.', true);
         return;
@@ -151,11 +206,22 @@
           {enableWorker: false, lazyLoad: false, liveBufferLatencyChasing: false});
         activeTs = player;
         player.on(window.mpegts.Events.ERROR, function (_type, detail) {
-          if (activeTs === player) message('Ошибка HTTP MPEG-TS: ' + String(detail || 'нет данных'), true);
+          if (activeTs !== player) return;
+          // If an already-configured HLS output exists (including satellite
+          // channels), try its browser player before declaring preview failed.
+          // No new source, encoder or public endpoint is created here.
+          if (hls && canHls) {
+            resetMedia();
+            playHls(hls);
+          } else {
+            message('Ошибка HTTP MPEG-TS: ' + String(detail || 'нет данных') +
+              '. Проверьте кодеки канала и доступность новых видеокадров.', true);
+          }
         });
         player.attachMediaElement(video);
         player.load();
-        message('HTTP MPEG-TS · ' + source.label + ' · звук включается в плеере');
+        message('HTTP MPEG-TS · ' + source.label + ' · звук включается в плеере. ' +
+          'Для спутникового MPEG-2/AC3 браузеру может потребоваться H.264/AAC-превью.');
         Promise.resolve(player.play()).catch(function () {
           if (activeTs === player) message('Нажмите ▶ для запуска видео.');
         });
@@ -225,5 +291,6 @@
       window.removeEventListener('pagehide', close);
     }};
   }
-  return {install: install, chooseHttpSource: chooseHttpSource, safeBrowserUrl: safeBrowserUrl};
+  return {install: install, chooseHttpSource: chooseHttpSource,
+    chooseHlsSource: chooseHlsSource, safeBrowserUrl: safeBrowserUrl};
 });

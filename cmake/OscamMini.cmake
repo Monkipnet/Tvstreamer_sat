@@ -24,7 +24,7 @@ if(TVSTREAMMERSAT5_BUILD_OSCAM_MINI)
       "${CMAKE_SOURCE_DIR}/scripts/build_oscam_mini.sh"
       "${OSCAM_MINI_SOURCE_DIR}/config.sh"
       "${OSCAM_MINI_SOURCE_DIR}/CMakeLists.txt"
-    COMMENT "Building vendored OSCam-mini (Newcamd + Phoenix + Irdeto + Viaccess + DRE Crypt)"
+    COMMENT "Building vendored OSCam-mini (Newcamd + Phoenix + PC/SC + compiled CA reader families)"
     USES_TERMINAL
     VERBATIM)
 
