@@ -1,6 +1,7 @@
 #include "GstTranscoderProcess.h"
 
 #include "TranscoderModule.h"
+#include "TranscodeVideoGeometry.h"
 #include "protocols/GstInputProtocols.h"
 #include "protocols/GstOutputProtocols.h"
 #include "protocols/GstProtocolTypes.h"
@@ -244,11 +245,14 @@ std::string selectedVideoEncoderFactory(const StreamConfig& cfg) {
     return {};
 }
 
-std::string scaledVideoCaps(int width, int height, const std::string& encoderFactory) {
+std::string scaledVideoCaps(const tvs::transcode::VideoGeometry& geometry,
+                            const std::string& encoderFactory) {
     const char* format = (encoderFactory == "nvh264enc" || isIntelVideoEncoder(encoderFactory)) ? "NV12" : "I420";
-    return "video/x-raw,format=" + std::string(format) + ",width=" + std::to_string(width) +
-           ",height=" + std::to_string(height) +
-           ",pixel-aspect-ratio=(fraction)1/1,interlace-mode=progressive";
+    return "video/x-raw,format=" + std::string(format) + ",width=" + std::to_string(geometry.width) +
+           ",height=" + std::to_string(geometry.height) +
+           ",pixel-aspect-ratio=(fraction)" + std::to_string(geometry.pixelAspectNum) +
+           "/" + std::to_string(geometry.pixelAspectDen) +
+           ",interlace-mode=progressive";
 }
 
 bool appendVideoEncoder(std::vector<std::string>& args, const StreamConfig& cfg,
@@ -525,9 +529,13 @@ bool appendSharedVideoEncoderCore(
     std::vector<std::string>& args,
     const StreamConfig& cfg,
     std::string& error) {
-    int width = 1920;
-    int height = 1080;
-    TranscoderModule::resolutionSize(cfg.transcodeResolution, width, height);
+    tvs::transcode::VideoGeometry geometry;
+    if (!tvs::transcode::videoGeometry(cfg.transcodeResolution, geometry)) {
+        error = "unsupported transcode resolution";
+        return false;
+    }
+    const int width = geometry.width;
+    const int height = geometry.height;
 
     const std::string encoderFactory = selectedVideoEncoderFactory(cfg);
     if (encoderFactory.empty()) {
@@ -568,7 +576,7 @@ bool appendSharedVideoEncoderCore(
     if (encoderFactory == "nvh264enc" || isIntelVideoEncoder(encoderFactory)) {
         args.insert(args.end(), {"!", "videoconvert"});
     }
-    args.insert(args.end(), {"!", scaledVideoCaps(width, height, encoderFactory)});
+    args.insert(args.end(), {"!", scaledVideoCaps(geometry, encoderFactory)});
 
     // 203.45: encode H.264 once. Keep a byte-stream-friendly shared encoder
     // output; per-output h264parse branches below convert to AVC when FLV needs it.
@@ -579,6 +587,7 @@ bool appendSharedVideoEncoderCore(
               << cfg.transcodeVideoEncoder
               << " selected=" << encoderFactory
               << " output=" << width << "x" << height
+              << " pixel_aspect_ratio=" << geometry.pixelAspectNum << "/" << geometry.pixelAspectDen
               << " bitrate=" << tvs::protocols::safeVideoBitrate(cfg)
               << " encode_instances=1"
               << std::endl;

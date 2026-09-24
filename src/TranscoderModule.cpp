@@ -1,4 +1,5 @@
 #include "TranscoderModule.h"
+#include "TranscodeVideoGeometry.h"
 
 #include <algorithm>
 #include <cerrno>
@@ -426,8 +427,15 @@ void onDecodedPadAdded(GstElement*, GstPad* pad, gpointer userData) {
     const std::string media = gst_structure_get_name(structure);
 
     if (media.rfind("video/x-raw", 0) == 0 && !context->videoLinked) {
-        int width = 1920, height = 1080;
-        TranscoderModule::resolutionSize(context->config.transcodeResolution, width, height);
+        tvs::transcode::VideoGeometry geometry;
+        if (!tvs::transcode::videoGeometry(context->config.transcodeResolution, geometry)) {
+            std::cerr << "Transcoder: unsupported output video geometry" << std::endl;
+            gst_caps_unref(caps);
+            drainPad(context->bin, pad);
+            return;
+        }
+        const int width = geometry.width;
+        const int height = geometry.height;
         const guint bitrateKbps = static_cast<guint>(
             std::max<uint64_t>(500000, context->config.transcodeVideoBitrate) / 1000);
 
@@ -459,7 +467,8 @@ void onDecodedPadAdded(GstElement*, GstPad* pad, gpointer userData) {
             "format", G_TYPE_STRING, rawFormat,
             "width", G_TYPE_INT, width,
             "height", G_TYPE_INT, height,
-            "pixel-aspect-ratio", GST_TYPE_FRACTION, 1, 1,
+            "pixel-aspect-ratio", GST_TYPE_FRACTION,
+            geometry.pixelAspectNum, geometry.pixelAspectDen,
             "interlace-mode", G_TYPE_STRING, "progressive",
             nullptr);
         g_object_set(filter, "caps", rawCaps, nullptr);
@@ -911,13 +920,11 @@ TranscoderCapabilities TranscoderModule::inspectCapabilities() {
 }
 
 bool TranscoderModule::resolutionSize(const std::string& value, int& width, int& height) {
-    if (value == "3840x2160") { width = 3840; height = 2160; return true; }
-    if (value == "3200x1800") { width = 3200; height = 1800; return true; }
-    if (value == "2560x1440") { width = 2560; height = 1440; return true; }
-    if (value == "1920x1080") { width = 1920; height = 1080; return true; }
-    if (value == "1280x720") { width = 1280; height = 720; return true; }
-    if (value == "720x576") { width = 720; height = 576; return true; }
-    return false;
+    tvs::transcode::VideoGeometry geometry;
+    if (!tvs::transcode::videoGeometry(value, geometry)) return false;
+    width = geometry.width;
+    height = geometry.height;
+    return true;
 }
 
 uint64_t TranscoderModule::recommendedVideoBitrate(const std::string& value) {
@@ -926,6 +933,8 @@ uint64_t TranscoderModule::recommendedVideoBitrate(const std::string& value) {
     if (value == "2560x1440") return 12000000;
     if (value == "1920x1080") return 6000000;
     if (value == "1280x720") return 3500000;
+    if (value == "1024x576") return 2500000;
+    if (value == "720x576_16_9") return 2000000;
     if (value == "720x576") return 2000000;
     return 6000000;
 }
