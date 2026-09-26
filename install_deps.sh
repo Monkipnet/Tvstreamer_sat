@@ -33,10 +33,6 @@ echo "Installing TVStreammerSAT5 dependencies..."
     build-essential \
     cmake \
     pkg-config \
-    libpcsclite-dev \
-    pcscd \
-    pcsc-tools \
-    libccid \
     libgstreamer1.0-dev \
     libgstreamer-plugins-base1.0-dev \
     libgstreamer-plugins-bad1.0-dev \

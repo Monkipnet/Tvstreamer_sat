@@ -37,6 +37,11 @@ struct RemapContext {
     bool audioLinked = false;
     bool flvMux = false;
     bool rtspPush = false;
+    // 203.73 RTSP ingest: RTSP servers may expose one RTP/MP2T pad instead of
+    // separate H.264/H.265 + audio RTP pads. Keep that direct transport branch
+    // single-shot so repeated RTSP pad notifications cannot create duplicate
+    // depay/demux chains.
+    bool rtspMpegTsLinked = false;
     bool hlsSink2 = false;
     // 203.05: restore the proven 202.74 HLS transport path. If hlsdemux
     // exposes complete MPEG-TS fragments, route them byte-for-byte through an

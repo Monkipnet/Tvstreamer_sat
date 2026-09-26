@@ -5186,6 +5186,35 @@ GstElement* capsFilterForMux(
     return filter;
 }
 
+struct RtspAacEncoderSelection {
+    GstElement* element = nullptr;
+    std::string factory;
+};
+
+RtspAacEncoderSelection makeRtspAacEncoder() {
+    for (const char* name : {"fdkaacenc", "voaacenc", "avenc_aac"}) {
+        if (!hasElementFactory(name)) continue;
+        return {gst_element_factory_make(name, nullptr), name};
+    }
+    return {};
+}
+
+void configureRtspAacEncoder(
+    GstElement* encoder, const std::string& factory, uint64_t requestedBitrate) {
+    if (!encoder) return;
+    const gint bitrate = static_cast<gint>(std::clamp<uint64_t>(requestedBitrate, 64000, 320000));
+    if (g_object_class_find_property(G_OBJECT_GET_CLASS(encoder), "bitrate")) {
+        g_object_set(encoder, "bitrate", bitrate, nullptr);
+    }
+    // libav AAC requires float PCM; the native AAC encoders use S16LE.
+    (void)factory;
+}
+
+bool rtspCapsEncoding(const std::string& capsLower, const char* encoding) {
+    return capsLower.find(std::string("encoding-name=(string)") + encoding) != std::string::npos ||
+           capsLower.find(std::string("encoding-name=") + encoding) != std::string::npos;
+}
+
 struct RtspPayloadFactories {
     const char* depay = nullptr;
     const char* parser = nullptr;
@@ -8953,14 +8982,35 @@ GstElement* StreamManager::createSourceChain(StreamState* state, GstElement* pip
             return nullptr;
         }
 
+        const std::string rtspMode = toLower(cfg.inputMode);
+        // RTSP-over-TCP is the safest default for IPTV/camera ingest because it
+        // does not require a second pair of dynamically negotiated UDP/RTP ports.
+        // Users can explicitly select RTSP UDP or RTSP Auto in the stream form.
+        gint rtspProtocols = 4; // GST_RTSP_LOWER_TRANS_TCP
+        const char* rtspTransport = "tcp";
+        if (rtspMode == "rtsp-udp") {
+            rtspProtocols = 1; // GST_RTSP_LOWER_TRANS_UDP
+            rtspTransport = "udp";
+        } else if (rtspMode == "rtsp-auto") {
+            rtspProtocols = 7; // UDP | UDP multicast | TCP
+            rtspTransport = "auto";
+        }
+
         g_object_set(src,
             "location", input.c_str(),
-            "latency", 300,
+            "latency", 500,
             "do-rtsp-keep-alive", TRUE,
             nullptr);
+        setIntPropertyIfPresent(src, "protocols", rtspProtocols);
         setUInt64PropertyIfPresent(src, "timeout", 5000000);
+        setUInt64PropertyIfPresent(src, "tcp-timeout", 5000000);
         setBooleanPropertyIfPresent(src, "ntp-sync", FALSE);
         configureLiveQueue(outputQueue, 1000000000ULL);
+        std::cerr << "RTSP input 203.73: uri=" << input
+                  << " transport=" << rtspTransport
+                  << " latency_ms=500 timeout_us=5000000"
+                  << " payloads=h264,h265,aac,mpa,pcma,pcmu,mp2t"
+                  << std::endl;
         configureTsMux(mux, cfg);
 
         if (!gst_element_link(mux, outputQueue)) {
@@ -10630,6 +10680,169 @@ void StreamManager::onRtspPadAdded(GstElement* src, GstPad* pad, gpointer user_d
             g_free(capsText);
         }
         gst_caps_unref(caps);
+    }
+
+    const std::string capsLower = toLower(capsString);
+
+    // Some IPTV encoders expose a complete MPEG-TS as RTP payload MP2T rather
+    // than separate elementary RTP pads. Depayload -> demux -> reuse the normal
+    // elementary remap callback so the rest of the pipeline remains identical.
+    if (rtspCapsEncoding(capsLower, "mp2t")) {
+        if (ctx->rtspMpegTsLinked) return;
+        for (const char* factory : {"rtpmp2tdepay", "tsparse", "tsdemux"}) {
+            if (!hasElementFactory(factory)) {
+                std::cerr << "missing RTSP MP2T element: " << factory << std::endl;
+                return;
+            }
+        }
+
+        GstElement* pipeline = GST_ELEMENT(gst_element_get_parent(ctx->mux));
+        if (!pipeline) return;
+        GstElement* queue = gst_element_factory_make("queue", nullptr);
+        GstElement* depay = gst_element_factory_make("rtpmp2tdepay", nullptr);
+        GstElement* tsparse = gst_element_factory_make("tsparse", nullptr);
+        GstElement* demux = gst_element_factory_make("tsdemux", nullptr);
+        if (!queue || !depay || !tsparse || !demux ||
+            !gst_bin_add(GST_BIN(pipeline), queue) ||
+            !gst_bin_add(GST_BIN(pipeline), depay) ||
+            !gst_bin_add(GST_BIN(pipeline), tsparse) ||
+            !gst_bin_add(GST_BIN(pipeline), demux)) {
+            std::cerr << "RTSP MP2T branch create failed" << std::endl;
+            gst_object_unref(pipeline);
+            return;
+        }
+        configureQueue(queue, 5000000000ULL);
+        setIntPropertyIfPresent(tsparse, "alignment", 7);
+        if (ctx->config.inputServiceId > 0) {
+            setIntPropertyIfPresent(demux, "program-number", static_cast<gint>(ctx->config.inputServiceId));
+        }
+        g_signal_connect(demux, "pad-added", G_CALLBACK(StreamManager::onDemuxPadAdded), ctx);
+        if (!gst_element_link_many(queue, depay, tsparse, demux, nullptr)) {
+            std::cerr << "RTSP MP2T branch static link failed" << std::endl;
+            gst_object_unref(pipeline);
+            return;
+        }
+        GstPad* queueSinkPad = gst_element_get_static_pad(queue, "sink");
+        const bool linked = queueSinkPad && gst_pad_link(pad, queueSinkPad) == GST_PAD_LINK_OK;
+        if (queueSinkPad) gst_object_unref(queueSinkPad);
+        if (!linked) {
+            std::cerr << "RTSP MP2T RTP pad link failed: " << capsString << std::endl;
+            gst_object_unref(pipeline);
+            return;
+        }
+        gst_element_sync_state_with_parent(queue);
+        gst_element_sync_state_with_parent(depay);
+        gst_element_sync_state_with_parent(tsparse);
+        gst_element_sync_state_with_parent(demux);
+        ctx->rtspMpegTsLinked = true;
+        std::cerr << "RTSP input 203.73: payload=MP2T depay=rtpmp2tdepay demux=tsdemux"
+                  << " input_sid=" << ctx->config.inputServiceId << std::endl;
+        gst_object_unref(pipeline);
+        return;
+    }
+
+    // Most IP cameras use G.711 (PCMA/PCMU). MPEG-TS output cannot rely on
+    // G.711 passthrough across receivers, so normalize this one RTSP audio
+    // branch to AAC-LC 48 kHz stereo while leaving H.264/H.265 video untouched.
+    const bool rtspPcma = rtspCapsEncoding(capsLower, "pcma");
+    const bool rtspPcmu = rtspCapsEncoding(capsLower, "pcmu");
+    if ((rtspPcma || rtspPcmu) && !ctx->audioLinked) {
+        const char* depayFactory = rtspPcma ? "rtppcmadepay" : "rtppcmudepay";
+        const char* decoderFactory = rtspPcma ? "alawdec" : "mulawdec";
+        for (const char* factory : {depayFactory, decoderFactory, "audioconvert", "audioresample", "aacparse"}) {
+            if (!hasElementFactory(factory)) {
+                std::cerr << "missing RTSP G711 element: " << factory << std::endl;
+                return;
+            }
+        }
+        RtspAacEncoderSelection aac = makeRtspAacEncoder();
+        if (!aac.element) {
+            std::cerr << "missing RTSP G711 AAC encoder: fdkaacenc/voaacenc/avenc_aac" << std::endl;
+            return;
+        }
+
+        GstElement* pipeline = GST_ELEMENT(gst_element_get_parent(ctx->mux));
+        if (!pipeline) {
+            gst_object_unref(aac.element);
+            return;
+        }
+        GstElement* queue = gst_element_factory_make("queue", nullptr);
+        GstElement* depay = gst_element_factory_make(depayFactory, nullptr);
+        GstElement* decoder = gst_element_factory_make(decoderFactory, nullptr);
+        GstElement* convert = gst_element_factory_make("audioconvert", nullptr);
+        GstElement* resample = gst_element_factory_make("audioresample", nullptr);
+        GstElement* rawFilter = gst_element_factory_make("capsfilter", nullptr);
+        GstElement* parser = gst_element_factory_make("aacparse", nullptr);
+        if (!queue || !depay || !decoder || !convert || !resample || !rawFilter || !parser) {
+            gst_object_unref(aac.element);
+            gst_object_unref(pipeline);
+            return;
+        }
+
+        GstCaps* rawCaps = gst_caps_new_simple(
+            "audio/x-raw",
+            "format", G_TYPE_STRING, aac.factory == "avenc_aac" ? "F32LE" : "S16LE",
+            "layout", G_TYPE_STRING, "interleaved",
+            "rate", G_TYPE_INT, 48000,
+            "channels", G_TYPE_INT, 2,
+            nullptr);
+        g_object_set(rawFilter, "caps", rawCaps, nullptr);
+        gst_caps_unref(rawCaps);
+        configureRtspAacEncoder(aac.element, aac.factory, ctx->config.transcodeAudioBitrate);
+        if (g_object_class_find_property(G_OBJECT_GET_CLASS(parser), "disable-passthrough")) {
+            g_object_set(parser, "disable-passthrough", TRUE, nullptr);
+        }
+        configureQueue(queue, 5000000000ULL);
+
+        for (GstElement* element : {queue, depay, decoder, convert, resample, rawFilter, aac.element, parser}) {
+            if (!gst_bin_add(GST_BIN(pipeline), element)) {
+                std::cerr << "RTSP G711 branch add failed" << std::endl;
+                gst_object_unref(pipeline);
+                return;
+            }
+        }
+        if (!gst_element_link_many(queue, depay, decoder, convert, resample, rawFilter, aac.element, parser, nullptr)) {
+            std::cerr << "RTSP G711 branch static link failed" << std::endl;
+            gst_object_unref(pipeline);
+            return;
+        }
+        GstPad* queueSinkPad = gst_element_get_static_pad(queue, "sink");
+        if (!queueSinkPad || gst_pad_link(pad, queueSinkPad) != GST_PAD_LINK_OK) {
+            if (queueSinkPad) gst_object_unref(queueSinkPad);
+            std::cerr << "RTSP G711 RTP pad link failed: " << capsString << std::endl;
+            gst_object_unref(pipeline);
+            return;
+        }
+        gst_object_unref(queueSinkPad);
+
+        GstPad* parserSrcPad = gst_element_get_static_pad(parser, "src");
+        GstPad* muxSinkPad = requestMuxSinkPad(ctx->mux, ctx->config.audioPid);
+        if (!parserSrcPad || !muxSinkPad || gst_pad_link(parserSrcPad, muxSinkPad) != GST_PAD_LINK_OK) {
+            if (parserSrcPad) gst_object_unref(parserSrcPad);
+            if (muxSinkPad) {
+                gst_element_release_request_pad(ctx->mux, muxSinkPad);
+                gst_object_unref(muxSinkPad);
+            }
+            std::cerr << "RTSP G711 AAC -> MPEG-TS mux link failed" << std::endl;
+            gst_object_unref(pipeline);
+            return;
+        }
+        const gchar* padName = GST_PAD_NAME(muxSinkPad);
+        ctx->audioLinked = true;
+        ctx->audioPadName = padName ? padName : "";
+        updateMuxProgramMap(ctx);
+        gst_object_unref(parserSrcPad);
+        gst_object_unref(muxSinkPad);
+
+        for (GstElement* element : {queue, depay, decoder, convert, resample, rawFilter, aac.element, parser}) {
+            gst_element_sync_state_with_parent(element);
+        }
+        std::cerr << "RTSP input 203.73: payload=" << (rtspPcma ? "PCMA" : "PCMU")
+                  << " audio_normalize=AAC-LC/48000/2 encoder=" << aac.factory
+                  << " bitrate=" << std::clamp<uint64_t>(ctx->config.transcodeAudioBitrate, 64000, 320000)
+                  << std::endl;
+        gst_object_unref(pipeline);
+        return;
     }
 
     RtspPayloadFactories factories = rtspPayloadFactories(capsString);
