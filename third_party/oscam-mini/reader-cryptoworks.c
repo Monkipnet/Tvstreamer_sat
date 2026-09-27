@@ -7,8 +7,8 @@
 
 struct cryptoworks_data
 {
-	BIGNUM          exp;
-	BIGNUM          ucpk;
+	BIGNUM          *exp;
+	BIGNUM          *ucpk;
 	int32_t         ucpk_valid;
 };
 
@@ -237,6 +237,16 @@ static int32_t cryptoworks_card_init(struct s_reader *reader, ATR *newatr)
 	if(!cs_malloc(&reader->csystem_data, sizeof(struct cryptoworks_data)))
 		{ return ERROR; }
 	struct cryptoworks_data *csystem_data = reader->csystem_data;
+csystem_data->exp = BN_new();
+csystem_data->ucpk = BN_new();
+if(!csystem_data->exp || !csystem_data->ucpk)
+{
+BN_free(csystem_data->exp);
+BN_free(csystem_data->ucpk);
+free(reader->csystem_data);
+reader->csystem_data = NULL;
+return ERROR;
+}
 
 	rdr_log(reader, "card detected");
 	rdr_log(reader, "type: CryptoWorks");
@@ -281,15 +291,15 @@ static int32_t cryptoworks_card_init(struct s_reader *reader, ATR *newatr)
 		if(search_boxkey(reader, reader->caid, (char *)keybuf))
 		{
 			ipk = BN_new();
-			BN_bin2bn(cwexp, sizeof(cwexp), &csystem_data->exp);
+			BN_bin2bn(cwexp, sizeof(cwexp), csystem_data->exp);
 			BN_bin2bn(keybuf, 64, ipk);
-			cw_RSA(reader, cta_res + 2, cta_res + 2, 0x40, &csystem_data->exp, ipk, 0);
+			cw_RSA(reader, cta_res + 2, cta_res + 2, 0x40, csystem_data->exp, ipk, 0);
 			BN_free(ipk);
 			csystem_data->ucpk_valid = (cta_res[2] == ((mfid & 0xFF) >> 1));
 			if(csystem_data->ucpk_valid)
 			{
 				cta_res[2] |= 0x80;
-				BN_bin2bn(cta_res + 2, 0x40, &csystem_data->ucpk);
+				BN_bin2bn(cta_res + 2, 0x40, csystem_data->ucpk);
 				rdr_log_dump_dbg(reader, D_READER, cta_res + 2, 0x40, "IPK available -> session-key:");
 			}
 			else
@@ -297,7 +307,7 @@ static int32_t cryptoworks_card_init(struct s_reader *reader, ATR *newatr)
 				csystem_data->ucpk_valid = (keybuf[0] == (((mfid & 0xFF) >> 1) | 0x80));
 				if(csystem_data->ucpk_valid)
 				{
-					BN_bin2bn(keybuf, 0x40, &csystem_data->ucpk);
+					BN_bin2bn(keybuf, 0x40, csystem_data->ucpk);
 					rdr_log_dump_dbg(reader, D_READER, keybuf, 0x40, "session-key found:");
 				}
 				else
@@ -399,7 +409,7 @@ static int32_t cryptoworks_do_ecm(struct s_reader *reader, const ECM_REQUEST *er
 					{
 						if(csystem_data->ucpk_valid)
 						{
-							cw_RSA(reader, &cta_res[i + 2], &cta_res[i + 2], n, &csystem_data->exp, &csystem_data->ucpk, 0);
+							cw_RSA(reader, &cta_res[i + 2], &cta_res[i + 2], n, csystem_data->exp, csystem_data->ucpk, 0);
 							rdr_log_dbg(reader, D_READER, "after camcrypt");
 							r = 0;
 							secLen = n - 4;
