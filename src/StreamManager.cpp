@@ -9427,12 +9427,18 @@ bool StreamManager::buildOutputBranch(
          (tvs::stream_protocols::isDvbInput(
               tvs::stream_protocols::inputKind(state->runtimeConfig)) &&
           state->runtimeConfig.inputServiceId > 0));
-    if (privateDvbPreview) {
+    const bool privateRtspPreview = type == "http" &&
+        outputConfig.outputHost == "127.0.0.1" && outputConfig.outputPort == 0 &&
+        state && !state->config.transcodeEnabled &&
+        tvs::stream_protocols::inputKind(state->runtimeConfig) ==
+            tvs::stream_protocols::InputProtocolKind::Rtsp &&
+        state->runtimeConfig.inputServiceId == 0;
+    if (privateDvbPreview || privateRtspPreview) {
         GstElement* queue = gst_element_factory_make(
-            "queue", branchName("private_dvb_preview_queue", branchIndex).c_str());
+            "queue", branchName(privateRtspPreview ? "private_rtsp_preview_queue" : "private_dvb_preview_queue", branchIndex).c_str());
         GstElement* sink = createOutputSink(
             state, outputConfig, pipeline,
-            branchName("private_dvb_preview_sink", branchIndex));
+            branchName(privateRtspPreview ? "private_rtsp_preview_sink" : "private_dvb_preview_sink", branchIndex));
         if (!queue || !sink || !addElementOrFail(pipeline, queue)) {
             if (queue && !GST_OBJECT_PARENT(queue)) gst_object_unref(queue);
             return false;
@@ -9442,10 +9448,17 @@ bool StreamManager::buildOutputBranch(
         // this channel's primary output while keeping TS packets intact.
         configureLiveQueue(queue, 1000000000ULL);
         const bool linked = gst_element_link_many(sourceTail, queue, sink, nullptr);
-        std::cerr << "SAT PREVIEW 203.73: stream=" << state->config.id
-                  << " transport=selected-SPTS-direct remux=off"
-                  << " service_reselection=off video_transcode=off"
-                  << " result=" << (linked ? "ready" : "link-failed") << std::endl;
+        if (privateRtspPreview) {
+            std::cerr << "RTSP PREVIEW 203.73: stream=" << state->config.id
+                      << " transport=input-rtsp-mux-SPTS-direct remux=off"
+                      << " service_reselection=off video_transcode=off"
+                      << " result=" << (linked ? "ready" : "link-failed") << std::endl;
+        } else {
+            std::cerr << "SAT PREVIEW 203.73: stream=" << state->config.id
+                      << " transport=selected-SPTS-direct remux=off"
+                      << " service_reselection=off video_transcode=off"
+                      << " result=" << (linked ? "ready" : "link-failed") << std::endl;
+        }
         return linked;
     }
 
@@ -9994,6 +10007,44 @@ bool StreamManager::buildHlsOutputPipeline(
     size_t branchIndex) {
     if (!state || !pipeline || !sourceTail) return false;
     const StreamConfig& cfg = outputConfig;
+
+    // 203.73 RTSP/HLS hotfix: RTSP input is already normalized to a clean
+    // single-program MPEG-TS by input_rtsp_ts_mux.  Demuxing that transport and
+    // immediately remuxing it again for HLS can stall at the second tsdemux on
+    // some live RTP timestamp layouts (observed signature: input bitrate is
+    // present, RTSP A/V pads are linked, remap_pre_demux_queue grows, but no
+    // video.m3u8/segment files are ever opened).  When no explicit remap is
+    // requested, feed the already-built SPTS directly to hlssink.  For CBR the
+    // input RTSP mux already owns target-rate NULL stuffing via configureTsMux().
+    const auto sourceProtocol = tvs::stream_protocols::inputKind(state->runtimeConfig);
+    const bool directRtspTs =
+        sourceProtocol == tvs::stream_protocols::InputProtocolKind::Rtsp &&
+        state->runtimeConfig.inputServiceId == 0 &&
+        !state->config.transcodeEnabled &&
+        !cfg.remapEnabled &&
+        hasElementFactory("hlssink");
+    if (directRtspTs) {
+        GstElement* queue = gst_element_factory_make(
+            "queue", branchName("hls_rtsp_direct_queue", branchIndex).c_str());
+        GstElement* sink = createOutputSink(
+            state, cfg, pipeline, branchName("hls_rtsp_direct_sink", branchIndex));
+        if (!queue || !sink || !addElementOrFail(pipeline, queue)) {
+            if (queue && !GST_OBJECT_PARENT(queue)) gst_object_unref(queue);
+            return false;
+        }
+        // Do not use a leaky queue here: dropping TS packets before a segmenter
+        // can create continuity gaps. Keep a bounded ten-second reservoir and
+        // preserve the PCR/PTS produced by input_rtsp_ts_mux.
+        configureQueue(queue, 10000000000ULL);
+        const bool linked = gst_element_link_many(sourceTail, queue, sink, nullptr);
+        std::cerr << "HLS RTSP direct TS 203.73: stream=" << state->config.id
+                  << " demux=off second_remux=off"
+                  << " input_mux=input_rtsp_ts_mux"
+                  << " cbr=" << (cbrMuxEnabled(cfg) ? std::to_string(cfg.targetBitrate) : "off")
+                  << " result=" << (linked ? "ready" : "link-failed")
+                  << std::endl;
+        return linked;
+    }
 
     // Explicit PID/SID remapping still needs our mpegtsmux so the configured
     // output mapping is preserved.  Feeding that freshly remuxed TS to the old
