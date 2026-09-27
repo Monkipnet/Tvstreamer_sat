@@ -77,9 +77,14 @@ struct StreamConfig {
     uint64_t targetBitrate = 2000000;
     bool transcodeEnabled = false;
     std::string transcodeResolution = "1920x1080";
-    std::string transcodeVideoCodec = "h264"; // h264 | copy
-    std::string transcodeVideoEncoder = "auto"; // auto | x264 | nvenc | intel
+    std::string transcodeVideoCodec = "h264"; // h264 | hevc | copy
+    std::string transcodeVideoEncoder = "auto"; // auto | x264/x265 CPU | nvenc | intel
     uint64_t transcodeVideoBitrate = 6000000;
+    // 203.75: adaptive HLS is opt-in. The configured rendition remains the
+    // primary/highest profile; lower renditions are generated automatically.
+    bool transcodeMultibitrateEnabled = false;
+    // Runtime-only rendition directory. Empty means the primary rendition.
+    std::string hlsVariantName;
     // HLS DVR archive. When enabled, live HLS segments are retained on disk and
     // exposed through Flussonic-compatible archive/timeshift playlist URLs.
     bool hlsArchiveEnabled = false;

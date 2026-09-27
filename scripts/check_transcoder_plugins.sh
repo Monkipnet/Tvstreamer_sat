@@ -22,6 +22,7 @@ required=(
   videorate
   capsfilter
   h264parse
+  h265parse
   audioconvert
   audioresample
   audiorate
@@ -50,10 +51,18 @@ x264_encoder=""
 if gst-inspect-1.0 x264enc >/dev/null 2>&1; then
   x264_encoder="x264enc"
 fi
+x265_encoder=""
+if gst-inspect-1.0 x265enc >/dev/null 2>&1; then
+  x265_encoder="x265enc"
+fi
 
 nvenc_encoder=""
 if gst-inspect-1.0 nvh264enc >/dev/null 2>&1; then
   nvenc_encoder="nvh264enc"
+fi
+nvenc_hevc_encoder=""
+if gst-inspect-1.0 nvh265enc >/dev/null 2>&1; then
+  nvenc_hevc_encoder="nvh265enc"
 fi
 
 if [[ -z "$x264_encoder" && -z "$nvenc_encoder" ]]; then
@@ -129,6 +138,8 @@ echo "  gst-launch: $(command -v gst-launch-1.0)"
 echo "  Auto video encoder: ${nvenc_encoder:-${x264_encoder:-not available}}"
 echo "  NVIDIA NVENC: ${nvenc_encoder:-not available}"
 echo "  CPU x264: ${x264_encoder:-not available}"
+echo "  HEVC NVENC: ${nvenc_hevc_encoder:-not available}"
+echo "  CPU x265: ${x265_encoder:-not available}"
 echo "  AAC encoder: ${aac_encoder}"
 echo "  MP3 encoder: ${mp3_encoder:-not available}"
 echo

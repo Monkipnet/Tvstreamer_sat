@@ -12,6 +12,11 @@ struct TranscoderCapabilities {
     bool nvencAvailable = false;
     bool intelAvailable = false;
     std::string intelEncoder;
+    std::string hevcVideoEncoder;
+    bool x265Available = false;
+    bool nvencHevcAvailable = false;
+    bool intelHevcAvailable = false;
+    std::string intelHevcEncoder;
     std::string audioEncoder;
     std::string aacEncoder;
     std::string mp3Encoder;
@@ -28,6 +33,7 @@ public:
     // encode probe. Factory presence alone is not enough: on older Intel GPUs
     // qsvh264enc can be registered but abort inside Media SDK/VAAPI at runtime.
     static std::string workingIntelVideoEncoderFactory();
+    static std::string workingIntelHevcEncoderFactory();
 
     // Creates a completely isolated GstBin with one generic input ghost pad and one
     // MPEG-TS source ghost pad. The bin owns parsing, decoding, scaling, encoding,

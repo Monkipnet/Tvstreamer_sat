@@ -16,6 +16,7 @@
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <sstream>
 #include <thread>
@@ -200,14 +201,20 @@ std::string commandLineForLog(const std::vector<std::string>& args) {
 }
 
 std::string intelVideoEncoderFactory() {
-    // 203.08: factory registration is not proof that the Intel backend works.
-    // TranscoderModule probes qsv/VA in an isolated child process and caches
-    // the first encoder that actually produces H.264 without aborting.
     return TranscoderModule::workingIntelVideoEncoderFactory();
 }
 
+std::string intelHevcVideoEncoderFactory() {
+    return TranscoderModule::workingIntelHevcEncoderFactory();
+}
+
+bool isNvidiaVideoEncoder(const std::string& factory) {
+    return factory == "nvh264enc" || factory == "nvh265enc";
+}
+
 bool isIntelVideoEncoder(const std::string& factory) {
-    return factory == "qsvh264enc" || factory == "vah264enc" || factory == "vaapih264enc";
+    return factory == "qsvh264enc" || factory == "vah264enc" || factory == "vaapih264enc" ||
+           factory == "qsvh265enc" || factory == "vah265enc" || factory == "vaapih265enc";
 }
 
 bool factoryLongNameContains(const char* factoryName, const std::string& needle) {
@@ -236,18 +243,33 @@ std::string softwareH264FeatureRankOverride() {
 }
 
 std::string selectedVideoEncoderFactory(const StreamConfig& cfg) {
-    if (cfg.transcodeVideoEncoder == "nvenc") return hasFactory("nvh264enc") ? "nvh264enc" : std::string();
-    if (cfg.transcodeVideoEncoder == "intel") return intelVideoEncoderFactory();
-    if (cfg.transcodeVideoEncoder == "x264") return hasFactory("x264enc") ? "x264enc" : std::string();
-    if (hasFactory("nvh264enc")) return "nvh264enc";
-    if (const std::string intel = intelVideoEncoderFactory(); !intel.empty()) return intel;
-    if (hasFactory("x264enc")) return "x264enc";
+    const bool hevc = toLower(cfg.transcodeVideoCodec) == "hevc";
+    const std::string requested = toLower(cfg.transcodeVideoEncoder);
+    if (requested == "nvenc") {
+        const char* name = hevc ? "nvh265enc" : "nvh264enc";
+        return hasFactory(name) ? name : std::string();
+    }
+    if (requested == "intel") {
+        return hevc ? intelHevcVideoEncoderFactory() : intelVideoEncoderFactory();
+    }
+    if (requested == "x264") {
+        const char* name = hevc ? "x265enc" : "x264enc";
+        return hasFactory(name) ? name : std::string();
+    }
+    if (hevc) {
+        if (hasFactory("nvh265enc")) return "nvh265enc";
+        if (const std::string intel = intelHevcVideoEncoderFactory(); !intel.empty()) return intel;
+        if (hasFactory("x265enc")) return "x265enc";
+    } else {
+        if (hasFactory("nvh264enc")) return "nvh264enc";
+        if (const std::string intel = intelVideoEncoderFactory(); !intel.empty()) return intel;
+        if (hasFactory("x264enc")) return "x264enc";
+    }
     return {};
 }
-
 std::string scaledVideoCaps(const tvs::transcode::VideoGeometry& geometry,
                             const std::string& encoderFactory) {
-    const char* format = (encoderFactory == "nvh264enc" || isIntelVideoEncoder(encoderFactory)) ? "NV12" : "I420";
+    const char* format = (isNvidiaVideoEncoder(encoderFactory) || isIntelVideoEncoder(encoderFactory)) ? "NV12" : "I420";
     return "video/x-raw,format=" + std::string(format) + ",width=" + std::to_string(geometry.width) +
            ",height=" + std::to_string(geometry.height) +
            ",pixel-aspect-ratio=(fraction)" + std::to_string(geometry.pixelAspectNum) +
@@ -257,23 +279,24 @@ std::string scaledVideoCaps(const tvs::transcode::VideoGeometry& geometry,
 
 bool appendVideoEncoder(std::vector<std::string>& args, const StreamConfig& cfg,
                         bool flv, int keyInt, std::string& error) {
+    const bool hevc = toLower(cfg.transcodeVideoCodec) == "hevc";
+    if (hevc && flv) {
+        error = "HEVC is not supported by the RTMP/YouTube FLV output; use H.264";
+        return false;
+    }
+
     const std::string encoderFactory = selectedVideoEncoderFactory(cfg);
     if (encoderFactory.empty()) {
-        if (cfg.transcodeVideoEncoder == "nvenc") {
-            error = "NVIDIA NVENC was requested but GStreamer nvh264enc is not available";
-        } else if (cfg.transcodeVideoEncoder == "intel") {
-            error = "Intel hardware H.264 was requested but no qsv/VA H.264 encoder passed the runtime probe";
-        } else if (cfg.transcodeVideoEncoder == "x264") {
-            error = "CPU x264 was requested but GStreamer x264enc is not available";
-        } else {
-            error = "no H.264 video encoder is available (need nvh264enc, Intel qsv/va or x264enc)";
-        }
+        error = hevc
+            ? "no HEVC video encoder is available (need nvh265enc, Intel qsv/va H.265 or x265enc)"
+            : "no H.264 video encoder is available (need nvh264enc, Intel qsv/va H.264 or x264enc)";
         return false;
     }
 
     const uint64_t bitrateKbps = tvs::protocols::safeVideoBitrate(cfg) / 1000;
     args.insert(args.end(), {"!", encoderFactory});
-    if (encoderFactory == "nvh264enc") {
+
+    if (encoderFactory == "nvh264enc" || encoderFactory == "nvh265enc") {
         args.insert(args.end(), {
             property("bitrate", std::to_string(bitrateKbps)),
             property("gop-size", std::to_string(keyInt)),
@@ -285,7 +308,7 @@ bool appendVideoEncoder(std::vector<std::string>& args, const StreamConfig& cfg,
             "strict-gop=true",
             property("vbv-buffer-size", std::to_string(std::max<uint64_t>(bitrateKbps, 500)))
         });
-    } else if (encoderFactory == "qsvh264enc") {
+    } else if (encoderFactory == "qsvh264enc" || encoderFactory == "qsvh265enc") {
         args.insert(args.end(), {
             property("bitrate", std::to_string(bitrateKbps)),
             property("gop-size", std::to_string(keyInt)),
@@ -293,23 +316,24 @@ bool appendVideoEncoder(std::vector<std::string>& args, const StreamConfig& cfg,
             "rate-control=cbr",
             "idr-interval=0"
         });
-    } else if (encoderFactory == "vah264enc") {
-        // Keep the GstVA command line on the conservative property set that is
-        // known to work on older Intel generations (including Ivy Bridge).
-        // h264parse downstream repeats codec headers, so encoder-specific AUD /
-        // target-usage knobs are intentionally not required here.
+    } else if (encoderFactory == "vah264enc" || encoderFactory == "vah265enc") {
         args.insert(args.end(), {
             property("bitrate", std::to_string(bitrateKbps)),
             property("key-int-max", std::to_string(keyInt)),
             "b-frames=0",
             "rate-control=cbr"
         });
-    } else if (encoderFactory == "vaapih264enc") {
-        // Legacy VAAPI fallback. Keep the argument set conservative because
-        // property names differ between Ubuntu/GStreamer generations.
+    } else if (encoderFactory == "vaapih264enc" || encoderFactory == "vaapih265enc") {
         args.insert(args.end(), {
             property("bitrate", std::to_string(bitrateKbps)),
             "rate-control=cbr"
+        });
+    } else if (encoderFactory == "x265enc") {
+        args.insert(args.end(), {
+            "tune=zerolatency",
+            "speed-preset=superfast",
+            property("bitrate", std::to_string(bitrateKbps)),
+            property("key-int-max", std::to_string(keyInt))
         });
     } else {
         args.insert(args.end(), {
@@ -328,7 +352,6 @@ bool appendVideoEncoder(std::vector<std::string>& args, const StreamConfig& cfg,
     }
     return true;
 }
-
 bool validateOutputAvailability(const StreamConfig& outputConfig, std::string& error) {
     std::vector<std::string> missing;
     validateFactories(tvs::protocols::requiredElementsForOutput(tvs::protocols::outputKind(outputConfig)), missing);
@@ -573,13 +596,13 @@ bool appendSharedVideoEncoderCore(
         });
     }
 
-    if (encoderFactory == "nvh264enc" || isIntelVideoEncoder(encoderFactory)) {
+    if (isNvidiaVideoEncoder(encoderFactory) || isIntelVideoEncoder(encoderFactory)) {
         args.insert(args.end(), {"!", "videoconvert"});
     }
     args.insert(args.end(), {"!", scaledVideoCaps(geometry, encoderFactory)});
 
-    // 203.45: encode H.264 once. Keep a byte-stream-friendly shared encoder
-    // output; per-output h264parse branches below convert to AVC when FLV needs it.
+    // 203.75: encode the selected H.264/HEVC profile once for all configured
+    // outputs in this child. Per-output parsers normalize elementary-stream caps.
     if (!appendVideoEncoder(args, cfg, false, 25, error)) return false;
     args.insert(args.end(), {"!", "tee", "name=transcode_video_encoded_tee"});
 
@@ -672,6 +695,7 @@ void appendSharedEncodedOutputBranches(
     const StreamConfig& cfg,
     const std::vector<SharedOutputBranch>& outputs) {
     const std::string audioCodec = toLower(cfg.transcodeAudioCodec);
+    const bool hevc = toLower(cfg.transcodeVideoCodec) == "hevc";
 
     for (const auto& output : outputs) {
         const std::string suffix = "_out" + std::to_string(output.index);
@@ -682,13 +706,21 @@ void appendSharedEncodedOutputBranches(
         addQueue(args, "transcode_video_mux_queue" + suffix,
                  output.temporaryPreview ? 1000000000ULL : 3000000000ULL,
                  output.temporaryPreview);
-        args.insert(args.end(), {
-            "!", "h264parse", property("config-interval", "-1"),
-            "!", flv
-                ? "video/x-h264,stream-format=avc,alignment=au"
-                : "video/x-h264,stream-format=byte-stream,alignment=au",
-            "!", output.spec.videoPad
-        });
+        if (hevc) {
+            args.insert(args.end(), {
+                "!", "h265parse", property("config-interval", "-1"),
+                "!", "video/x-h265,stream-format=byte-stream,alignment=au",
+                "!", output.spec.videoPad
+            });
+        } else {
+            args.insert(args.end(), {
+                "!", "h264parse", property("config-interval", "-1"),
+                "!", flv
+                    ? "video/x-h264,stream-format=avc,alignment=au"
+                    : "video/x-h264,stream-format=byte-stream,alignment=au",
+                "!", output.spec.videoPad
+            });
+        }
 
         args.insert(args.end(), {"transcode_audio_encoded_tee.", "!"});
         addQueue(args, "transcode_audio_mux_queue" + suffix,
@@ -712,6 +744,87 @@ void appendSharedEncodedOutputBranches(
     }
 }
 
+struct AbrRendition {
+    std::string name;
+    std::string resolution;
+    uint64_t bitrate = 0;
+};
+
+std::vector<AbrRendition> abrRenditions(const StreamConfig& cfg) {
+    int baseWidth = 0, baseHeight = 0;
+    if (!TranscoderModule::resolutionSize(cfg.transcodeResolution, baseWidth, baseHeight)) return {};
+    const uint64_t basePixels = static_cast<uint64_t>(baseWidth) * static_cast<uint64_t>(baseHeight);
+    const uint64_t baseBitrate = tvs::protocols::safeVideoBitrate(cfg);
+
+    const std::vector<AbrRendition> ladder = {
+        {"1080p", "1920x1080", 6000000},
+        {"720p",  "1280x720",  3500000},
+        {"576p",  "1024x576",  2200000},
+        {"576i",  "720x576_16_9", 1600000}
+    };
+
+    std::vector<AbrRendition> result;
+    for (auto rendition : ladder) {
+        int width = 0, height = 0;
+        if (!TranscoderModule::resolutionSize(rendition.resolution, width, height)) continue;
+        const uint64_t pixels = static_cast<uint64_t>(width) * static_cast<uint64_t>(height);
+        if (pixels >= basePixels || rendition.resolution == cfg.transcodeResolution) continue;
+        rendition.bitrate = std::min<uint64_t>(rendition.bitrate, baseBitrate * 3 / 4);
+        if (rendition.bitrate < 500000 || rendition.bitrate >= baseBitrate) continue;
+        result.push_back(std::move(rendition));
+        if (result.size() >= 3) break;
+    }
+    return result;
+}
+
+std::filesystem::path abrBaseDirectory(const StreamConfig& cfg) {
+    return cfg.hlsArchiveEnabled
+        ? std::filesystem::path(cfg.hlsArchivePath) / cfg.id
+        : std::filesystem::path("/tmp/tvstreammersat5-hls") / cfg.id;
+}
+
+bool writeAbrMasterPlaylist(const StreamConfig& cfg,
+                            const std::vector<AbrRendition>& renditions,
+                            std::string& error) {
+    std::error_code ec;
+    const auto dir = abrBaseDirectory(cfg);
+    std::filesystem::create_directories(dir, ec);
+    if (ec) {
+        error = "failed to create HLS ABR directory: " + ec.message();
+        return false;
+    }
+    std::ofstream out(dir / "master.m3u8", std::ios::trunc);
+    if (!out.is_open()) {
+        error = "failed to create HLS ABR master playlist";
+        return false;
+    }
+
+    out << "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-INDEPENDENT-SEGMENTS\n";
+    int width = 0, height = 0;
+    if (!TranscoderModule::resolutionSize(cfg.transcodeResolution, width, height)) {
+        error = "invalid primary ABR resolution";
+        return false;
+    }
+    const uint64_t audio = tvs::protocols::safeAudioBitrate(cfg);
+    out << "#EXT-X-STREAM-INF:BANDWIDTH="
+        << (tvs::protocols::safeVideoBitrate(cfg) + audio + 350000)
+        << ",RESOLUTION=" << width << "x" << height << "\n";
+    out << "video.m3u8\n";
+
+    for (const auto& rendition : renditions) {
+        if (!TranscoderModule::resolutionSize(rendition.resolution, width, height)) continue;
+        out << "#EXT-X-STREAM-INF:BANDWIDTH="
+            << (rendition.bitrate + audio + 350000)
+            << ",RESOLUTION=" << width << "x" << height << "\n";
+        out << "abr/" << rendition.name << "/video.m3u8\n";
+    }
+    out.flush();
+    if (!out.good()) {
+        error = "failed to write HLS ABR master playlist";
+        return false;
+    }
+    return true;
+}
 
 } // namespace
 
@@ -906,6 +1019,11 @@ std::vector<std::string> GstTranscoderProcess::buildSharedCommand(
     for (std::size_t index = 0; index < outputConfigs.size(); ++index) {
         const auto& outputConfig = outputConfigs[index];
         if (!validateOutputAvailability(outputConfig, error)) return {};
+        if (toLower(baseConfig.transcodeVideoCodec) == "hevc" &&
+            tvs::protocols::isFlvOutput(tvs::protocols::outputKind(outputConfig))) {
+            error = "HEVC is not supported for RTMP/YouTube FLV output; select H.264";
+            return {};
+        }
 
         std::vector<std::string> outputFragment;
         GstOutputSpec outputSpec;
@@ -950,7 +1068,7 @@ std::vector<std::string> GstTranscoderProcess::buildSharedCommand(
                   << " scope=post-decode action=exit-for-parent-failover"
                   << std::endl;
         if (!appendTranscoderDecodeInput(args, baseConfig, error)) return {};
-        std::cerr << "GStreamer transcoder 203.57: video=h264"
+        std::cerr << "GStreamer transcoder 203.75: video=" << toLower(baseConfig.transcodeVideoCodec)
                   << " encoder_request=" << baseConfig.transcodeVideoEncoder
                   << " deinterlace=yadif-top-fields"
                   << " cadence=fixed-25p"
@@ -960,6 +1078,10 @@ std::vector<std::string> GstTranscoderProcess::buildSharedCommand(
                   << std::endl;
     }
 
+    if (toLower(baseConfig.transcodeVideoCodec) == "hevc" && !hasFactory("h265parse")) {
+        error = "HEVC was requested but GStreamer h265parse is not available";
+        return {};
+    }
     if (!appendSharedVideoEncoderCore(args, baseConfig, error)) return {};
     if (!appendSharedAudioEncoderCore(args, baseConfig, error)) return {};
     appendSharedEncodedOutputBranches(args, baseConfig, outputs);
@@ -979,9 +1101,12 @@ bool GstTranscoderProcess::start(const StreamConfig& config, std::string& error)
     }
 
     auto outputs = tvs::protocols::outputConfigs(config);
-    // 203.67 preview: share decoded/encoded A/V with the existing child process.
-    // The private HTTP sink has no clients until an authenticated admin opens
-    // the preview. No second source, decoder or video/audio encoder is launched.
+    const bool hasHls = std::any_of(outputs.begin(), outputs.end(),
+        [](const StreamConfig& output) {
+            return tvs::protocols::normalizedOutputType(output) == "hls";
+        });
+
+    // Private preview continues to share the primary process.
     const bool hasHttp = std::any_of(outputs.begin(), outputs.end(),
         [](const StreamConfig& output) {
             return tvs::protocols::normalizedOutputType(output) == "http";
@@ -1009,53 +1134,84 @@ bool GstTranscoderProcess::start(const StreamConfig& config, std::string& error)
         return false;
     }
 
-    std::cerr << "GStreamer shared transcoder 203.45: outputs=" << outputs.size()
-              << " decode_instances=1 video_encode_instances=1 audio_encode_instances=1"
-              << " mux_policy=per-output"
+    std::cerr << "GStreamer transcoder 203.75: codec=" << toLower(config.transcodeVideoCodec)
+              << " outputs=" << outputs.size()
+              << " multibitrate=" << (config.transcodeMultibitrateEnabled ? "on" : "off")
               << std::endl;
-    for (std::size_t index = 0; index < outputs.size(); ++index) {
-        const auto& output = outputs[index];
-        const auto outputKind = tvs::protocols::outputKind(output);
-        std::cerr << "GStreamer shared transcoder output 203.45: index=" << index
-                  << " type=" << tvs::protocols::normalizedOutputType(output)
-                  << " host=" << output.outputHost
-                  << " port=" << output.outputPort;
-        if (outputKind == tvs::protocols::OutputKind::FifoRelay) {
-            std::cerr << " ts-relay=unpaced";
-        } else if (tvs::protocols::isTsOutput(outputKind)) {
-            if (tvs::protocols::transportCbrEnabled(output)) {
-                std::cerr << " ts-cbr-bitrate=" << tvs::protocols::muxBitrate(output);
-            } else {
-                std::cerr << " ts-cbr=off";
-            }
-        } else {
-            std::cerr << " encoder-cbr-bitrate=" << tvs::protocols::safeVideoBitrate(output);
-        }
-        std::cerr << std::endl;
-    }
-
     std::cerr << "GStreamer transcoder command: " << commandLineForLog(args) << std::endl;
 
     ChildProcess child;
     if (!spawnProcess(args, description, child, error)) return false;
-
-    std::cerr << "GStreamer shared transcoder started pid=" << child.pid
-              << " outputs=" << outputs.size()
-              << " remap=" << (config.remapEnabled ? "on" : "off")
-              << " input_sid=" << effectiveInputServiceId(config)
-              << " service=" << config.serviceId
-              << " vpid=" << config.videoPid
-              << " apid=" << config.audioPid
-              << std::endl;
 
     {
         std::lock_guard<std::mutex> lock(childrenMutex);
         children.clear();
         children.push_back(std::move(child));
     }
+
+    if (config.transcodeMultibitrateEnabled &&
+        toLower(config.transcodeVideoCodec) != "copy") {
+        if (!hasHls) {
+            std::cerr << "HLS ABR 203.75: checkbox enabled but no HLS output exists; "
+                         "primary stream remains unchanged" << std::endl;
+        } else {
+            const auto renditions = abrRenditions(config);
+            for (const auto& rendition : renditions) {
+                StreamConfig variant = config;
+                variant.transcodeMultibitrateEnabled = false;
+                variant.hlsVariantName = rendition.name;
+                variant.transcodeResolution = rendition.resolution;
+                variant.transcodeVideoBitrate = rendition.bitrate;
+                variant.outputType = "hls";
+                variant.outputMode = "listener";
+                variant.additionalOutputs.clear();
+                variant.targetBitrate = std::max<uint64_t>(
+                    rendition.bitrate + tvs::protocols::safeAudioBitrate(variant) + 1200000,
+                    rendition.bitrate + 1500000);
+
+                std::vector<StreamConfig> variantOutputs{variant};
+                std::string variantDescription;
+                std::string variantError;
+                auto variantArgs = buildSharedCommand(
+                    variant, variantOutputs, variantDescription, variantError);
+                if (!variantError.empty() || variantArgs.empty()) {
+                    error = "HLS ABR rendition " + rendition.name + ": " +
+                        (variantError.empty() ? "failed to build pipeline" : variantError);
+                    stop();
+                    return false;
+                }
+
+                ChildProcess variantChild;
+                if (!spawnProcess(variantArgs, "abr-" + rendition.name, variantChild, variantError)) {
+                    error = "HLS ABR rendition " + rendition.name + ": " + variantError;
+                    stop();
+                    return false;
+                }
+                {
+                    std::lock_guard<std::mutex> lock(childrenMutex);
+                    children.push_back(std::move(variantChild));
+                }
+                std::cerr << "HLS ABR 203.75: rendition=" << rendition.name
+                          << " resolution=" << rendition.resolution
+                          << " video_bitrate=" << rendition.bitrate
+                          << std::endl;
+            }
+
+            std::string masterError;
+            if (!writeAbrMasterPlaylist(config, renditions, masterError)) {
+                error = masterError;
+                stop();
+                return false;
+            }
+            std::cerr << "HLS ABR 203.75: master="
+                      << (abrBaseDirectory(config) / "master.m3u8")
+                      << " renditions=" << (renditions.size() + 1)
+                      << std::endl;
+        }
+    }
+
     return true;
 }
-
 void GstTranscoderProcess::stop() {
     stopping = true;
     std::lock_guard<std::mutex> lock(childrenMutex);

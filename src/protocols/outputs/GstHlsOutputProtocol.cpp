@@ -47,9 +47,14 @@ std::string hlsPublicPathName(const StreamConfig& cfg) {
 }
 
 std::string prepareHlsDirectory(const StreamConfig& cfg) {
-    const std::string dir = cfg.hlsArchiveEnabled
-        ? (std::filesystem::path(cfg.hlsArchivePath) / cfg.id).string()
-        : (std::filesystem::path("/tmp/tvstreammersat5-hls") / cfg.id).string();
+    std::filesystem::path dir = cfg.hlsArchiveEnabled
+        ? (std::filesystem::path(cfg.hlsArchivePath) / cfg.id)
+        : (std::filesystem::path("/tmp/tvstreammersat5-hls") / cfg.id);
+    if (!cfg.hlsVariantName.empty()) {
+        dir /= "abr";
+        dir /= cfg.hlsVariantName;
+    }
+
     std::error_code ec;
     if (!cfg.hlsArchiveEnabled) {
         std::filesystem::remove_all(dir, ec);
@@ -69,9 +74,8 @@ std::string prepareHlsDirectory(const StreamConfig& cfg) {
             ec.clear();
         }
     }
-    return dir;
+    return dir.string();
 }
-
 std::string hlsSegmentPattern(const StreamConfig& cfg, const std::string& dir) {
     if (!cfg.hlsArchiveEnabled) return dir + "/segment%05d.ts";
     const auto epoch = std::chrono::duration_cast<std::chrono::seconds>(
@@ -137,7 +141,8 @@ bool appendHlsSink(std::vector<std::string>& args, const StreamConfig& cfg, GstO
         "hlssink",
         "playlist-location=" + dir + "/video.m3u8",
         "location=" + hlsSegmentPattern(cfg, dir),
-        "playlist-root=/" + hlsPublicPathName(cfg) + "/",
+        "playlist-root=/" + hlsPublicPathName(cfg) + "/" +
+            (cfg.hlsVariantName.empty() ? std::string() : "abr/" + cfg.hlsVariantName + "/"),
         "target-duration=2",
         "max-files=" + std::to_string(cfg.hlsArchiveEnabled ? std::max<uint32_t>(9u, cfg.hlsArchiveHours * 1800u + 60u) : 9u),
         "playlist-length=7"

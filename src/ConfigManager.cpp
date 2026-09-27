@@ -395,14 +395,19 @@ StreamConfig StreamConfig::fromJson(const Json::Value& root) {
     config.targetBitrate = root.get("target_bitrate", Json::UInt64(2000000)).asUInt64();
     config.transcodeEnabled = root.get("transcode_enabled", false).asBool();
     config.transcodeResolution = root.get("transcode_resolution", "1920x1080").asString();
-    config.transcodeVideoCodec = root.get("transcode_video_codec", "h264").asString();
-    if (config.transcodeVideoCodec != "copy") config.transcodeVideoCodec = "h264";
+    config.transcodeVideoCodec = toLower(root.get("transcode_video_codec", "h264").asString());
+    if (config.transcodeVideoCodec == "h265") config.transcodeVideoCodec = "hevc";
+    if (config.transcodeVideoCodec != "h264" && config.transcodeVideoCodec != "hevc" &&
+        config.transcodeVideoCodec != "copy") {
+        config.transcodeVideoCodec = "h264";
+    }
     config.transcodeVideoEncoder = toLower(root.get("transcode_video_encoder", "auto").asString());
     if (config.transcodeVideoEncoder != "auto" && config.transcodeVideoEncoder != "x264" &&
         config.transcodeVideoEncoder != "nvenc" && config.transcodeVideoEncoder != "intel") {
         config.transcodeVideoEncoder = "auto";
     }
     config.transcodeVideoBitrate = root.get("transcode_video_bitrate", Json::UInt64(6000000)).asUInt64();
+    config.transcodeMultibitrateEnabled = root.get("transcode_multibitrate_enabled", false).asBool();
     config.hlsArchiveEnabled = root.get("hls_archive_enabled", false).asBool();
     config.hlsArchiveHours = std::clamp(root.get("hls_archive_hours", 24).asUInt(), 1u, 168u);
     config.hlsArchivePath = root.get("hls_archive_path", "/var/lib/tvstreammersat5/archive").asString();
@@ -478,6 +483,7 @@ Json::Value StreamConfig::toJson() const {
     root["transcode_video_codec"] = transcodeVideoCodec;
     root["transcode_video_encoder"] = transcodeVideoEncoder;
     root["transcode_video_bitrate"] = Json::UInt64(transcodeVideoBitrate);
+    root["transcode_multibitrate_enabled"] = transcodeMultibitrateEnabled;
     root["hls_archive_enabled"] = hlsArchiveEnabled;
     root["hls_archive_hours"] = hlsArchiveHours;
     root["hls_archive_path"] = hlsArchivePath;

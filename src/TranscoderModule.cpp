@@ -1,5 +1,6 @@
 #include "TranscoderModule.h"
 #include "TranscodeVideoGeometry.h"
+#include "utils.h"
 
 #include <algorithm>
 #include <cerrno>
@@ -120,19 +121,47 @@ std::string intelVideoEncoderFactory() {
     return TranscoderModule::workingIntelVideoEncoderFactory();
 }
 
+std::string intelHevcVideoEncoderFactory() {
+    return TranscoderModule::workingIntelHevcEncoderFactory();
+}
+
+bool isNvidiaVideoEncoder(const std::string& factory) {
+    return factory == "nvh264enc" || factory == "nvh265enc";
+}
+
 bool isIntelVideoEncoder(const std::string& factory) {
-    return factory == "qsvh264enc" || factory == "vah264enc" || factory == "vaapih264enc";
+    return factory == "qsvh264enc" || factory == "vah264enc" || factory == "vaapih264enc" ||
+           factory == "qsvh265enc" || factory == "vah265enc" || factory == "vaapih265enc";
+}
+
+bool isHevcEncoderFactory(const std::string& factory) {
+    return factory == "nvh265enc" || factory == "qsvh265enc" ||
+           factory == "vah265enc" || factory == "vaapih265enc" || factory == "x265enc";
 }
 
 std::string selectedVideoEncoderFactory(const StreamConfig& config) {
-    const std::string requested = config.transcodeVideoEncoder;
-    if (requested == "nvenc") return factoryAvailable("nvh264enc") ? "nvh264enc" : std::string();
-    if (requested == "intel") return intelVideoEncoderFactory();
-    if (requested == "x264") return factoryAvailable("x264enc") ? "x264enc" : std::string();
-    // Auto: discrete NVIDIA first, then Intel hardware, then CPU x264.
-    if (factoryAvailable("nvh264enc")) return "nvh264enc";
-    if (const std::string intel = intelVideoEncoderFactory(); !intel.empty()) return intel;
-    if (factoryAvailable("x264enc")) return "x264enc";
+    const bool hevc = toLower(config.transcodeVideoCodec) == "hevc";
+    const std::string requested = toLower(config.transcodeVideoEncoder);
+    if (requested == "nvenc") {
+        const char* name = hevc ? "nvh265enc" : "nvh264enc";
+        return factoryAvailable(name) ? name : std::string();
+    }
+    if (requested == "intel") {
+        return hevc ? intelHevcVideoEncoderFactory() : intelVideoEncoderFactory();
+    }
+    if (requested == "x264") {
+        const char* name = hevc ? "x265enc" : "x264enc";
+        return factoryAvailable(name) ? name : std::string();
+    }
+    if (hevc) {
+        if (factoryAvailable("nvh265enc")) return "nvh265enc";
+        if (const std::string intel = intelHevcVideoEncoderFactory(); !intel.empty()) return intel;
+        if (factoryAvailable("x265enc")) return "x265enc";
+    } else {
+        if (factoryAvailable("nvh264enc")) return "nvh264enc";
+        if (const std::string intel = intelVideoEncoderFactory(); !intel.empty()) return intel;
+        if (factoryAvailable("x264enc")) return "x264enc";
+    }
     return {};
 }
 
@@ -156,35 +185,33 @@ void setEnumIfPresent(GstElement* element, const char* property, const char* val
 
 void configureVideoEncoder(GstElement* encoder, const std::string& factory, guint bitrateKbps) {
     if (!encoder) return;
-    if (factory == "nvh264enc") {
-        g_object_set(encoder,
-            "bitrate", bitrateKbps,
-            "gop-size", 50,
-            "bframes", 0u,
-            "aud", TRUE,
-            "zerolatency", TRUE,
-            "repeat-sequence-header", TRUE,
-            "strict-gop", TRUE,
-            "vbv-buffer-size", std::max<guint>(bitrateKbps, 500u),
-            nullptr);
+
+    if (isNvidiaVideoEncoder(factory)) {
+        setUIntIfPresent(encoder, "bitrate", bitrateKbps);
+        setUIntIfPresent(encoder, "gop-size", 50);
+        setUIntIfPresent(encoder, "bframes", 0);
+        setBoolIfPresent(encoder, "aud", TRUE);
+        setBoolIfPresent(encoder, "zerolatency", TRUE);
+        setBoolIfPresent(encoder, "repeat-sequence-header", TRUE);
+        setBoolIfPresent(encoder, "strict-gop", TRUE);
+        setUIntIfPresent(encoder, "vbv-buffer-size", std::max<guint>(bitrateKbps, 500u));
         setEnumIfPresent(encoder, "rc-mode", "cbr");
         return;
     }
+
     if (isIntelVideoEncoder(factory)) {
         setUIntIfPresent(encoder, "bitrate", bitrateKbps);
         setUIntIfPresent(encoder, "b-frames", 0);
         setBoolIfPresent(encoder, "aud", TRUE);
-        if (factory == "qsvh264enc") {
+        if (factory == "qsvh264enc" || factory == "qsvh265enc") {
             setUIntIfPresent(encoder, "gop-size", 50);
             setUIntIfPresent(encoder, "idr-interval", 0);
             setEnumIfPresent(encoder, "rate-control", "cbr");
-        } else if (factory == "vah264enc") {
+        } else if (factory == "vah264enc" || factory == "vah265enc") {
             setUIntIfPresent(encoder, "key-int-max", 50);
             setEnumIfPresent(encoder, "rate-control", "cbr");
             setUIntIfPresent(encoder, "target-usage", 4);
         } else {
-            // Legacy vaapih264enc names differ across GStreamer releases; only
-            // set properties when the installed element actually exposes them.
             setUIntIfPresent(encoder, "keyframe-period", 50);
             setUIntIfPresent(encoder, "key-int-max", 50);
             setEnumIfPresent(encoder, "rate-control", "cbr");
@@ -192,6 +219,15 @@ void configureVideoEncoder(GstElement* encoder, const std::string& factory, guin
         return;
     }
 
+    if (factory == "x265enc") {
+        setUIntIfPresent(encoder, "bitrate", bitrateKbps);
+        setUIntIfPresent(encoder, "key-int-max", 50);
+        setEnumIfPresent(encoder, "speed-preset", "superfast");
+        setEnumIfPresent(encoder, "tune", "zerolatency");
+        return;
+    }
+
+    // x264: retain the proven low-latency CBR profile.
     g_object_set(encoder,
         "bitrate", bitrateKbps,
         "key-int-max", 50,
@@ -440,21 +476,23 @@ void onDecodedPadAdded(GstElement*, GstPad* pad, gpointer userData) {
             std::max<uint64_t>(500000, context->config.transcodeVideoBitrate) / 1000);
 
         const std::string videoEncoderFactory = selectedVideoEncoderFactory(context->config);
+        const bool hevc = toLower(context->config.transcodeVideoCodec) == "hevc";
+        const bool hardwareVideo = isNvidiaVideoEncoder(videoEncoderFactory) || isIntelVideoEncoder(videoEncoderFactory);
         GstElement* queue = gst_element_factory_make("queue", nullptr);
         GstElement* convert = gst_element_factory_make("videoconvert", nullptr);
         GstElement* deinterlace = gst_element_factory_make("deinterlace", nullptr);
         GstElement* scale = gst_element_factory_make("videoscale", nullptr);
-        GstElement* postScaleConvert = (videoEncoderFactory == "nvh264enc" || isIntelVideoEncoder(videoEncoderFactory))
+        GstElement* postScaleConvert = hardwareVideo
             ? gst_element_factory_make("videoconvert", nullptr)
             : nullptr;
         GstElement* filter = gst_element_factory_make("capsfilter", nullptr);
         GstElement* encoder = videoEncoderFactory.empty()
             ? nullptr
             : gst_element_factory_make(videoEncoderFactory.c_str(), nullptr);
-        GstElement* parser = gst_element_factory_make("h264parse", nullptr);
+        GstElement* parser = gst_element_factory_make(hevc ? "h265parse" : "h264parse", nullptr);
         GstElement* outQueue = gst_element_factory_make("queue", nullptr);
         if (!queue || !convert || !deinterlace || !scale ||
-            ((videoEncoderFactory == "nvh264enc" || isIntelVideoEncoder(videoEncoderFactory)) && !postScaleConvert) ||
+            (hardwareVideo && !postScaleConvert) ||
             !filter || !encoder || !parser || !outQueue) {
             std::cerr << "Transcoder: missing video elements" << std::endl;
             gst_caps_unref(caps);
@@ -462,7 +500,7 @@ void onDecodedPadAdded(GstElement*, GstPad* pad, gpointer userData) {
             return;
         }
 
-        const char* rawFormat = (videoEncoderFactory == "nvh264enc" || isIntelVideoEncoder(videoEncoderFactory)) ? "NV12" : "I420";
+        const char* rawFormat = hardwareVideo ? "NV12" : "I420";
         GstCaps* rawCaps = gst_caps_new_simple("video/x-raw",
             "format", G_TYPE_STRING, rawFormat,
             "width", G_TYPE_INT, width,
@@ -854,6 +892,32 @@ std::string TranscoderModule::workingIntelVideoEncoderFactory() {
     return selected;
 }
 
+std::string TranscoderModule::workingIntelHevcEncoderFactory() {
+    static std::once_flag probeOnce;
+    static std::string selected;
+
+    std::call_once(probeOnce, []() {
+        for (const char* name : {"qsvh265enc", "vah265enc", "vaapih265enc"}) {
+            if (!factoryAvailable(name)) continue;
+            const EncoderProbeResult probe = probeVideoEncoderFactory(name);
+            std::cerr << "Intel HEVC encoder probe 203.75: factory=" << name
+                      << " result=" << (probe.ok ? "ok" : "failed");
+            if (probe.timedOut) std::cerr << " reason=timeout";
+            else if (probe.signal != 0) std::cerr << " signal=" << probe.signal;
+            else if (probe.exitCode >= 0) std::cerr << " exit=" << probe.exitCode;
+            std::cerr << std::endl;
+            if (probe.ok) {
+                selected = name;
+                break;
+            }
+        }
+        std::cerr << "Intel HEVC encoder selection 203.75: selected="
+                  << (selected.empty() ? "none" : selected)
+                  << " policy=runtime-probe qsv->va->legacy-vaapi" << std::endl;
+    });
+    return selected;
+}
+
 TranscoderCapabilities TranscoderModule::inspectCapabilities() {
     TranscoderCapabilities result;
     std::string gstLaunchPath;
@@ -863,25 +927,42 @@ TranscoderCapabilities TranscoderModule::inspectCapabilities() {
     const char* required[] = {
         "uridecodebin", "decodebin", "queue",
         "videoconvert", "deinterlace", "videoscale", "videorate", "capsfilter",
-        "h264parse",
         "audioconvert", "audioresample",
         "aacparse", "mpegtsmux", "udpsink", nullptr
     };
-
     for (const char** name = required; *name; ++name) {
         GstElementFactory* factory = gst_element_factory_find(*name);
         if (!factory) result.missingElements.emplace_back(*name);
         else gst_object_unref(factory);
     }
 
+    const bool h264Parser = factoryAvailable("h264parse");
     result.x264Available = factoryAvailable("x264enc");
     result.nvencAvailable = factoryAvailable("nvh264enc");
     result.intelEncoder = intelVideoEncoderFactory();
     result.intelAvailable = !result.intelEncoder.empty();
-    if (result.nvencAvailable) result.videoEncoder = "nvh264enc";
-    else if (result.intelAvailable) result.videoEncoder = result.intelEncoder;
-    else if (result.x264Available) result.videoEncoder = "x264enc";
-    else result.missingElements.emplace_back("H.264 encoder: nvh264enc, qsvh264enc/vah264enc/vaapih264enc or x264enc");
+    if (h264Parser) {
+        if (result.nvencAvailable) result.videoEncoder = "nvh264enc";
+        else if (result.intelAvailable) result.videoEncoder = result.intelEncoder;
+        else if (result.x264Available) result.videoEncoder = "x264enc";
+    }
+
+    const bool hevcParser = factoryAvailable("h265parse");
+    result.x265Available = factoryAvailable("x265enc");
+    result.nvencHevcAvailable = factoryAvailable("nvh265enc");
+    result.intelHevcEncoder = intelHevcVideoEncoderFactory();
+    result.intelHevcAvailable = !result.intelHevcEncoder.empty();
+    if (hevcParser) {
+        if (result.nvencHevcAvailable) result.hevcVideoEncoder = "nvh265enc";
+        else if (result.intelHevcAvailable) result.hevcVideoEncoder = result.intelHevcEncoder;
+        else if (result.x265Available) result.hevcVideoEncoder = "x265enc";
+    }
+
+    if (result.videoEncoder.empty() && result.hevcVideoEncoder.empty()) {
+        result.missingElements.emplace_back(
+            "video encoder: H.264 nvh264/qsv/va/x264 or HEVC nvh265/qsv/va/x265");
+    }
+
     GstElementFactory* aacParser = gst_element_factory_find("aacparse");
     if (aacParser) {
         gst_object_unref(aacParser);
@@ -913,7 +994,10 @@ TranscoderCapabilities TranscoderModule::inspectCapabilities() {
     }
     result.available = result.missingElements.empty();
     result.message = result.available
-        ? "GStreamer transcoding is available: preferred video encoder " + result.videoEncoder +
+        ? "GStreamer transcoding is available: H.264=" +
+              (result.videoEncoder.empty() ? std::string("unavailable") : result.videoEncoder) +
+              ", HEVC=" +
+              (result.hevcVideoEncoder.empty() ? std::string("unavailable") : result.hevcVideoEncoder) +
               ", gst-launch=" + gstLaunchPath
         : "Transcoding is unavailable because required GStreamer elements are missing";
     return result;
@@ -940,7 +1024,9 @@ uint64_t TranscoderModule::recommendedVideoBitrate(const std::string& value) {
 }
 
 GstElement* TranscoderModule::createBin(const StreamConfig& config, std::string& error) {
-    const std::string videoCodec = config.transcodeVideoCodec == "copy" ? "copy" : "h264";
+    const std::string videoCodec =
+        config.transcodeVideoCodec == "copy" ? "copy" :
+        (toLower(config.transcodeVideoCodec) == "hevc" ? "hevc" : "h264");
     int width = 0, height = 0;
     if (videoCodec != "copy" && !resolutionSize(config.transcodeResolution, width, height)) {
         error = "unsupported transcode resolution";
@@ -959,17 +1045,19 @@ GstElement* TranscoderModule::createBin(const StreamConfig& config, std::string&
         return nullptr;
     }
     if (videoCodec != "copy") {
-        const std::string requestedEncoder = config.transcodeVideoEncoder;
-        if (requestedEncoder == "nvenc" && !capabilities.nvencAvailable) {
-            error = "NVIDIA NVENC was requested but GStreamer nvh264enc is not available";
+        if (videoCodec == "hevc" && !factoryAvailable("h265parse")) {
+            error = "HEVC was requested but GStreamer h265parse is not available";
             return nullptr;
         }
-        if (requestedEncoder == "intel" && !capabilities.intelAvailable) {
-            error = "Intel hardware H.264 was requested but qsvh264enc/vah264enc/vaapih264enc is not available";
+        if (videoCodec == "h264" && !factoryAvailable("h264parse")) {
+            error = "H.264 was requested but GStreamer h264parse is not available";
             return nullptr;
         }
-        if (requestedEncoder == "x264" && !capabilities.x264Available) {
-            error = "CPU x264 was requested but GStreamer x264enc is not available";
+        const std::string selected = selectedVideoEncoderFactory(config);
+        if (selected.empty()) {
+            error = videoCodec == "hevc"
+                ? "HEVC encoder is unavailable (need nvh265enc, Intel qsv/va H.265, or x265enc)"
+                : "H.264 encoder is unavailable (need nvh264enc, Intel qsv/va H.264, or x264enc)";
             return nullptr;
         }
     }

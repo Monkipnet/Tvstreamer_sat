@@ -62,7 +62,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN set -eux; \
     for element in \
       uridecodebin decodebin queue videoconvert deinterlace videoscale videorate \
-      capsfilter x264enc h264parse audioconvert audioresample audiorate aacparse \
+      capsfilter x264enc h264parse h265parse audioconvert audioresample audiorate aacparse \
       mpegtsmux udpsink dvbsrc tsparse tsdemux appsink; do \
         gst-inspect-1.0 "$element" >/dev/null; \
     done; \
