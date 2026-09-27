@@ -3,6 +3,7 @@ FROM ubuntu:24.04 AS build
 ENV DEBIAN_FRONTEND=noninteractive
 
 # Build dependencies match the libraries requested by CMakeLists.txt.
+# OSCam-mini PC/SC support requires libpcsclite-dev at build time.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     cmake \
@@ -11,6 +12,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libboost-thread-dev \
     libcurl4-openssl-dev \
     libssl-dev \
+    libpcsclite-dev \
     libcrypt-dev \
     libdvbcsa-dev \
     libgstreamer1.0-dev \
@@ -31,12 +33,16 @@ ENV DEBIAN_FRONTEND=noninteractive
 
 # Ubuntu 24.04 uses the time64 curl runtime package (libcurl4t64).
 # gstreamer1.0-rtsp is required for rtspclientsink used by RTSP push output.
+# libpcsclite1/pcscd/pcsc-tools are installed for OSCam-mini PC/SC readers.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     libboost-system1.83.0 \
     libboost-thread1.83.0 \
     libcurl4t64 \
     libssl3t64 \
+    libpcsclite1 \
+    pcscd \
+    pcsc-tools \
     libcrypt1 \
     libdvbcsa1 \
     libjsoncpp25 \
@@ -66,8 +72,25 @@ RUN set -eux; \
     else echo "No supported AAC encoder was found in the runtime image" >&2; exit 1; fi
 
 COPY --from=build /src/build/TVStreammerSAT5 /app/TVStreammerSAT5
-RUN mkdir -p /opt/tvstreammersat5/ca-plugins
-COPY --from=build /src/build/tvstreammersat5-ca-newcamd.so /opt/tvstreammersat5/ca-plugins/tvstreammersat5-ca-newcamd.so
+
+RUN mkdir -p /opt/tvstreammersat5/ca-plugins \
+             /opt/TVStreammerSAT5/oscam-mini/config \
+             /opt/TVStreammerSAT5/oscam-mini/default-config
+
+COPY --from=build /src/build/tvstreammersat5-ca-newcamd.so \
+    /opt/tvstreammersat5/ca-plugins/tvstreammersat5-ca-newcamd.so
+
+# OSCam-mini is built as part of the default CMake ALL target.
+COPY --from=build /src/build/oscam-mini/oscam-mini \
+    /opt/TVStreammerSAT5/oscam-mini/oscam-mini
+
+COPY --from=build /src/packaging/oscam-mini/default-config/ \
+    /opt/TVStreammerSAT5/oscam-mini/default-config/
+
+# Seed the active config so OSCam-mini can be launched immediately.
+RUN cp -a /opt/TVStreammerSAT5/oscam-mini/default-config/. \
+          /opt/TVStreammerSAT5/oscam-mini/config/ \
+    && chmod 0755 /opt/TVStreammerSAT5/oscam-mini/oscam-mini
 
 WORKDIR /data
 EXPOSE 9000/tcp

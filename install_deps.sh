@@ -4,6 +4,7 @@ set -euo pipefail
 # TVStreammerSAT5 host build/runtime dependencies for Ubuntu/Debian.
 # This script intentionally installs only libraries used by the current CMake
 # target plus GStreamer runtime plugins used by the protocol/transcoder modules.
+# OSCam-mini PC/SC builds require libpcsclite-dev and PC/SC runtime tools.
 
 if ! command -v apt-get >/dev/null 2>&1; then
     echo "This installer requires an apt-based Ubuntu/Debian system." >&2
@@ -39,6 +40,9 @@ echo "Installing TVStreammerSAT5 dependencies..."
     libcurl4-openssl-dev \
     libjsoncpp-dev \
     libssl-dev \
+    libpcsclite-dev \
+    pcscd \
+    pcsc-tools \
     libcrypt-dev \
     libdvbcsa-dev \
     "${BOOST_SYSTEM_DEV_PACKAGE}" \
